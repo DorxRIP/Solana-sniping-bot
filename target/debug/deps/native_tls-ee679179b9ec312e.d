@@ -1,6 +1,0 @@
-C:\Users\lsh19\Sol Ai Bot\target\debug\deps\native_tls-ee679179b9ec312e.d: C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\native-tls-0.2.18\src\lib.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\native-tls-0.2.18\src\imp\schannel.rs
-
-C:\Users\lsh19\Sol Ai Bot\target\debug\deps\libnative_tls-ee679179b9ec312e.rmeta: C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\native-tls-0.2.18\src\lib.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\native-tls-0.2.18\src\imp\schannel.rs
-
-C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\native-tls-0.2.18\src\lib.rs:
-C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\native-tls-0.2.18\src\imp\schannel.rs:

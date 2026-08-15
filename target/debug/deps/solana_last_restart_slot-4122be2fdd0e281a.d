@@ -1,8 +1,0 @@
-C:\Users\lsh19\Sol Ai Bot\target\debug\deps\solana_last_restart_slot-4122be2fdd0e281a.d: C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\solana-last-restart-slot-2.2.1\src\lib.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\solana-last-restart-slot-2.2.1\src\sysvar.rs
-
-C:\Users\lsh19\Sol Ai Bot\target\debug\deps\libsolana_last_restart_slot-4122be2fdd0e281a.rlib: C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\solana-last-restart-slot-2.2.1\src\lib.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\solana-last-restart-slot-2.2.1\src\sysvar.rs
-
-C:\Users\lsh19\Sol Ai Bot\target\debug\deps\libsolana_last_restart_slot-4122be2fdd0e281a.rmeta: C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\solana-last-restart-slot-2.2.1\src\lib.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\solana-last-restart-slot-2.2.1\src\sysvar.rs
-
-C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\solana-last-restart-slot-2.2.1\src\lib.rs:
-C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\solana-last-restart-slot-2.2.1\src\sysvar.rs:

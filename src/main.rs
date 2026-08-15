@@ -16,12 +16,25 @@ const CYAN: &str = "\x1b[36m";
 const YELLOW: &str = "\x1b[33m";
 const BLUE: &str = "\x1b[34m";
 const WHITE: &str = "\x1b[37m";
+const RED: &str = "\x1b[31m";
+
+const PUMP_ASCII: &str = r#" ______   __  __   ___ __ __   ______
+/_____ /\ /_/\/_/\ /__//_//_/\ /_____ /\
+\:::_ \ \\:\ \:\ \\::\| \| \ \\:::_ \ \
+ \:(_) \ \\:\ \:\ \\:.      \ \\:(_) \ \
+  \: ___\/ \:\ \:\ \\:.\-/\  \ \\: ___\/
+   \ \ \    \:\_\:\ \ . \  \  \ \\ \ \   
+    \_\/     \_____\/ \__\/ \__\/ \_\/   "#;
 
 #[tokio::main]
 async fn main() {
     loop {
         match connect_and_listen().await {
-            Ok(_) => {
+            Ok(true) => {
+                println!("{}Scanner shutdown requested. Exiting cleanly.{}", YELLOW, RESET);
+                break;
+            }
+            Ok(false) => {
                 println!("{}WebSocket session ended. Reconnecting in {}s...{}", YELLOW, RECONNECT_DELAY.as_secs(), RESET);
             }
             Err(err) => {
@@ -33,7 +46,8 @@ async fn main() {
     }
 }
 
-async fn connect_and_listen() -> Result<(), Box<dyn Error>> {
+async fn connect_and_listen() -> Result<bool, Box<dyn Error>> {
+    println!("{}{}{}", RED, PUMP_ASCII, RESET);
     println!("\n{}PUMP.FUN TOKEN SCANNER{}", YELLOW, RESET);
     println!("{}Real-time new token detection via PumpPortal{}\n", CYAN, RESET);
 
@@ -49,31 +63,42 @@ async fn connect_and_listen() -> Result<(), Box<dyn Error>> {
 
     println!("[{}] {}Subscribed — waiting for new tokens...{}", timestamp(), GREEN, RESET);
 
+    let mut shutdown = Box::pin(tokio::signal::ctrl_c());
+
     loop {
-        match ws_stream.next().await {
-            Some(Ok(Message::Text(text))) => {
-                if let Some(token) = parse_token_message(&text) {
-                    print_token(token);
-                } else if text.contains("Successfully subscribed") {
-                    println!("[{}] {}Subscribed — waiting for new tokens...{}", timestamp(), GREEN, RESET);
-                } else if text.contains("Invalid") || text.contains("error") || text.contains("Error") {
-                    eprintln!("[{}] {}{}{}", timestamp(), YELLOW, text, RESET);
+        tokio::select! {
+            _ = shutdown.as_mut() => {
+                println!("{}\nInterrupted by user. Closing websocket...{}", YELLOW, RESET);
+                ws_stream.close(None).await.ok();
+                return Ok(true);
+            }
+            msg = ws_stream.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Some(token) = parse_token_message(&text) {
+                            print_token(token);
+                        } else if text.contains("Successfully subscribed") {
+                            println!("[{}] {}Subscribed — waiting for new tokens...{}", timestamp(), GREEN, RESET);
+                        } else if text.contains("Invalid") || text.contains("error") || text.contains("Error") {
+                            eprintln!("[{}] {}{}{}", timestamp(), YELLOW, text, RESET);
+                        }
+                    }
+                    Some(Ok(Message::Binary(bytes))) => {
+                        let text = String::from_utf8_lossy(&bytes);
+                        if let Some(token) = parse_token_message(&text) {
+                            print_token(token);
+                        }
+                    }
+                    Some(Ok(Message::Ping(_))) => {
+                        ws_stream.send(Message::Pong(vec![].into())).await?;
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        return Ok(false);
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => return Err(Box::new(err)),
                 }
             }
-            Some(Ok(Message::Binary(bytes))) => {
-                let text = String::from_utf8_lossy(&bytes);
-                if let Some(token) = parse_token_message(&text) {
-                    print_token(token);
-                }
-            }
-            Some(Ok(Message::Ping(_))) => {
-                ws_stream.send(Message::Pong(vec![].into())).await?;
-            }
-            Some(Ok(Message::Close(_))) | None => {
-                return Err("WebSocket closed by server".into());
-            }
-            Some(Ok(_)) => {}
-            Some(Err(err)) => return Err(Box::new(err)),
         }
     }
 }

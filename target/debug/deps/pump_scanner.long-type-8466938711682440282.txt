@@ -1,0 +1,2 @@
+impl futures_util::Future<Output = Result<(), std::io::Error>>
+&mut impl futures_util::Future<Output = Result<(), std::io::Error>>

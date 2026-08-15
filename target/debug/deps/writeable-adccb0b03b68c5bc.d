@@ -1,0 +1,12 @@
+C:\Users\lsh19\Sol Ai Bot\target\debug\deps\writeable-adccb0b03b68c5bc.d: C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\lib.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\cmp.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\concat.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\impls.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\ops.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\parts_write_adapter.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\replace.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\try_writeable.rs
+
+C:\Users\lsh19\Sol Ai Bot\target\debug\deps\libwriteable-adccb0b03b68c5bc.rmeta: C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\lib.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\cmp.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\concat.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\impls.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\ops.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\parts_write_adapter.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\replace.rs C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\try_writeable.rs
+
+C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\lib.rs:
+C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\cmp.rs:
+C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\concat.rs:
+C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\impls.rs:
+C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\ops.rs:
+C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\parts_write_adapter.rs:
+C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\replace.rs:
+C:\Users\lsh19\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\writeable-0.6.4\src\try_writeable.rs:

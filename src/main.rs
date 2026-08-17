@@ -1,5 +1,4 @@
 use base64::Engine;
-use bs58;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use solana_sdk::hash::Hash;
@@ -480,7 +479,7 @@ async fn connect_and_listen(config: TradingConfig) -> Result<bool, Box<dyn Error
                         }
                     }
                     Some(Ok(Message::Ping(_))) => {
-                        ws_stream.send(Message::Pong(vec![].into())).await?;
+                        ws_stream.send(Message::Pong(vec![])).await?;
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         return Ok(false);
@@ -515,9 +514,7 @@ fn print_trade_config(config: TradingConfig) {
 fn parse_token_message(raw: &str) -> Option<Token> {
     let value: Value = serde_json::from_str(raw).ok()?;
 
-    if value.get("mint").is_none() {
-        return None;
-    }
+    value.get("mint")?;
 
     if value.get("txType").and_then(|v| v.as_str()) != Some("create") {
         return None;

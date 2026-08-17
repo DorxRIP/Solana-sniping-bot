@@ -73,8 +73,8 @@ impl TradingConfig {
 // TRADING SETTINGS
 // ----------------------------
 // Change values here — this is the main area to edit your bot settings.
-const GAS_PRIORITY_SOL: f64 = 0.00005;
-const BRIBE_PRIORITY_SOL: f64 = 0.00005;
+const GAS_PRIORITY_SOL: f64 = 0.0000001;
+const BRIBE_PRIORITY_SOL: f64 = 0.0000001;
 const SLIPPAGE_PCT: f64 = 25.0;
 const MEV_PROTECTION: bool = false;
 const PUMP_TOKENS_ONLY: bool = true;

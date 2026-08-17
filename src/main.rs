@@ -3,12 +3,11 @@ use bs58;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use solana_sdk::hash::Hash;
-use solana_sdk::instruction::Instruction;
 use solana_sdk::message::Message as SolanaMessage;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::{SeedDerivable, Signer};
 use solana_sdk::system_instruction;
-use solana_sdk::transaction::Transaction;
+use solana_sdk::transaction::{Transaction, VersionedTransaction};
 use std::error::Error;
 use std::str::FromStr;
 use std::sync::atomic::AtomicUsize;
@@ -29,7 +28,9 @@ const CYAN: &str = "\x1b[36m";
 const YELLOW: &str = "\x1b[33m";
 const BLUE: &str = "\x1b[34m";
 const WHITE: &str = "\x1b[37m";
+const GRAY: &str = "\x1b[90m";
 const RED: &str = "\x1b[31m";
+const BOLD: &str = "\x1b[1m";
 
 const PUMP_ASCII: &str = r#" ______   __  __   ___ __ __   ______
 /_____ /\ /_/\/_/\ /__//_//_/\ /_____ /\
@@ -49,7 +50,6 @@ struct TradingConfig {
     auto_buy_new_tokens: bool,
     auto_sell_profit_pct: f64,
     auto_sell_percent: f64,
-    trade_amount_sol: f64,
     starting_sol_balance: f64,
 }
 
@@ -64,7 +64,6 @@ impl TradingConfig {
             auto_buy_new_tokens: AUTO_BUY_NEW_TOKENS,
             auto_sell_profit_pct: AUTO_SELL_PROFIT_PCT,
             auto_sell_percent: AUTO_SELL_PERCENT,
-            trade_amount_sol: TRADE_AMOUNT_SOL,
             starting_sol_balance: STARTING_SOL_BALANCE,
         }
     }
@@ -82,10 +81,17 @@ const PUMP_TOKENS_ONLY: bool = true;
 const AUTO_BUY_NEW_TOKENS: bool = true;
 const AUTO_SELL_PROFIT_PCT: f64 = 50.0;
 const AUTO_SELL_PERCENT: f64 = 100.0;
-// A 0.1 SOL trade at a 50% target realizes +0.05 SOL when 100% is sold.
-const TRADE_AMOUNT_SOL: f64 = 0.1;
-const MAX_ACTIVE_DRY_RUN_POSITIONS: usize = 1;
 const STARTING_SOL_BALANCE: f64 = 2.0;
+const TRADE_AMOUNT_SOL: f64 = 0.1;
+
+// ----------------------------
+// TOKEN LAYOUT SETTINGS
+// ----------------------------
+// Change values here — this is the main area to edit your token display.
+const TOKEN_BOX_WIDTH: usize = 93; // Full inner width; long links expand the box automatically.
+const MIGRATION_TITLE: &str = "🎯 MIGRATION";
+const PLATFORM_TITLE: &str = "🟢 PUMP.FUN";
+const MONITOR_LINE: &str = "────────────────────────────────────────────────────────────────────────────────";
 
 fn build_config() -> TradingConfig {
     TradingConfig::defaults()
@@ -97,6 +103,7 @@ struct WalletInfo {
     balance_sol: f64,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 struct ExecutionStatus {
     valid_private_key: bool,
@@ -207,13 +214,13 @@ async fn get_recent_blockhash(rpc_url: &str) -> Option<Hash> {
     Hash::from_str(blockhash).ok()
 }
 
-async fn send_real_devnet_tx_smoke_test() -> Result<String, Box<dyn Error>> {
+async fn send_real_mainnet_tx_smoke_test() -> Result<String, Box<dyn Error>> {
     let enable_real_tx = std::env::var("ENABLE_REAL_TX")
         .unwrap_or_default()
         .eq_ignore_ascii_case("true");
 
     if !enable_real_tx {
-        return Err("ENABLE_REAL_TX is not true; devnet transaction execution is disabled".into());
+        return Err("ENABLE_REAL_TX is not true; mainnet transaction execution is disabled".into());
     }
 
     let private_key = std::env::var("PRIVATE_KEY")?;
@@ -221,12 +228,12 @@ async fn send_real_devnet_tx_smoke_test() -> Result<String, Box<dyn Error>> {
         .ok_or("PRIVATE_KEY is not a valid base58 Solana key")?;
 
     let wallet_pubkey = keypair.pubkey().to_string();
-    let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "https://api.devnet.solana.com".to_string());
+    let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
     let balance_lamports = get_balance_lamports(&rpc_url, &wallet_pubkey).await
         .ok_or("Could not load wallet balance from RPC")?;
 
     if balance_lamports < 1_000 {
-        return Err(format!("Wallet balance is too low to sign a devnet tx: {} lamports", balance_lamports).into());
+        return Err(format!("Wallet balance is too low to sign a mainnet tx: {} lamports", balance_lamports).into());
     }
 
     let recent_blockhash = get_recent_blockhash(&rpc_url).await
@@ -265,9 +272,9 @@ async fn send_real_devnet_tx_smoke_test() -> Result<String, Box<dyn Error>> {
         .and_then(|v| v.as_str())
         .ok_or("sendTransaction did not return a signature")?;
 
-    println!("{}REAL DEVNET TX SENT:{} {}{}", CYAN, RESET, GREEN, signature);
+    println!("{}REAL MAINNET TX SENT:{} {}{}", CYAN, RESET, GREEN, signature);
 
-    let confirmation_url = format!("https://explorer.solana.com/tx/{signature}?cluster=devnet");
+    let confirmation_url = format!("https://explorer.solana.com/tx/{signature}");
     println!("{}CONFIRMATION:{} {}{}", CYAN, RESET, BLUE, confirmation_url);
 
     Ok(signature.to_string())
@@ -373,7 +380,7 @@ async fn main() {
 
     let private_key = std::env::var("PRIVATE_KEY").unwrap_or_else(|_| String::new());
     if private_key.is_empty() {
-        println!("{}DRY RUN: private key is not required and no transactions will be sent.{}", CYAN, RESET);
+        eprintln!("{}PRIVATE_KEY is missing. Add it to .env as PRIVATE_KEY=YOUR_KEY{}", RED, RESET);
     } else {
         println!("{}PRIVATE_KEY loaded from .env{}", GREEN, RESET);
     }
@@ -387,11 +394,17 @@ async fn main() {
         println!("{}WALLET:{} {}{}", CYAN, RESET, wallet.pubkey, RESET);
     }
 
-    if std::env::var("ENABLE_REAL_TX")
-        .unwrap_or_default()
-        .eq_ignore_ascii_case("true")
-    {
-        eprintln!("{}DRY RUN MODE: ENABLE_REAL_TX is ignored; no transaction will be sent.{}", YELLOW, RESET);
+    if real_trade_enabled() {
+        println!("{}LIVE MODE ENABLED: real mainnet execution is ON{}", GREEN, RESET);
+    } else {
+        println!("{}DRY RUN MODE: real mainnet execution is OFF{}", YELLOW, RESET);
+    }
+
+    if real_trade_enabled() {
+        match send_real_mainnet_tx_smoke_test().await {
+            Ok(_) => println!("{}MAINNET TX TEST COMPLETED{}", GREEN, RESET),
+            Err(err) => eprintln!("{}MAINNET TX TEST FAILED:{} {}{}", RED, RESET, YELLOW, err),
+        }
     }
 
     println!("{}EXECUTION GATES{}", CYAN, RESET);
@@ -428,16 +441,8 @@ async fn connect_and_listen(config: TradingConfig) -> Result<bool, Box<dyn Error
     println!("\n{}PUMP.FUN TOKEN SCANNER{}", YELLOW, RESET);
     println!("{}Real-time new token detection via PumpPortal{}\n", CYAN, RESET);
 
-    let pumpportal_api_key = std::env::var("PUMPPORTAL_API_KEY").unwrap_or_default();
-    let can_track_live_trades = !pumpportal_api_key.trim().is_empty();
-    let ws_url = if pumpportal_api_key.trim().is_empty() {
-        WS_URL.to_string()
-    } else {
-        format!("{WS_URL}?api-key={}", pumpportal_api_key.trim())
-    };
-
     println!("[{}] {}Connecting to PumpPortal WebSocket...{}", timestamp(), YELLOW, RESET);
-    let (mut ws_stream, _) = connect_async(&ws_url).await?;
+    let (mut ws_stream, _) = connect_async(WS_URL).await?;
 
     println!("[{}] {}Connected{}", timestamp(), GREEN, RESET);
     println!("[{}] {}Subscribing to new token events...{}", timestamp(), YELLOW, RESET);
@@ -461,15 +466,7 @@ async fn connect_and_listen(config: TradingConfig) -> Result<bool, Box<dyn Error
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Some(token) = parse_token_message(&text) {
-                            if let Some(mint) = start_dry_run_position(token, config) {
-                                if can_track_live_trades {
-                                    subscribe_to_token_trades(&mut ws_stream, &mint).await?;
-                                } else {
-                                    eprintln!("{}DRY RUN: PUMPPORTAL_API_KEY is missing; cannot monitor {} live.{}", YELLOW, mint, RESET);
-                                }
-                            }
-                        } else if let Some((mint, market_cap_sol)) = parse_market_cap_update(&text) {
-                            update_dry_run_position(&mint, market_cap_sol, config);
+                            print_token(token).await;
                         } else if text.contains("Successfully subscribed") {
                             println!("[{}] {}Subscribed — waiting for new tokens...{}", timestamp(), GREEN, RESET);
                         } else if text.contains("Invalid") || text.contains("error") || text.contains("Error") {
@@ -479,15 +476,7 @@ async fn connect_and_listen(config: TradingConfig) -> Result<bool, Box<dyn Error
                     Some(Ok(Message::Binary(bytes))) => {
                         let text = String::from_utf8_lossy(&bytes);
                         if let Some(token) = parse_token_message(&text) {
-                            if let Some(mint) = start_dry_run_position(token, config) {
-                                if can_track_live_trades {
-                                    subscribe_to_token_trades(&mut ws_stream, &mint).await?;
-                                } else {
-                                    eprintln!("{}DRY RUN: PUMPPORTAL_API_KEY is missing; cannot monitor {} live.{}", YELLOW, mint, RESET);
-                                }
-                            }
-                        } else if let Some((mint, market_cap_sol)) = parse_market_cap_update(&text) {
-                            update_dry_run_position(&mint, market_cap_sol, config);
+                            print_token(token).await;
                         }
                     }
                     Some(Ok(Message::Ping(_))) => {
@@ -520,8 +509,6 @@ fn print_trade_config(config: TradingConfig) {
     println!("{}Auto buy new tokens:{} {}", YELLOW, RESET, if config.auto_buy_new_tokens { "YES" } else { "NO" });
     println!("{}Auto sell profit:{} {:.0}%", YELLOW, RESET, config.auto_sell_profit_pct);
     println!("{}Auto sell amount:{} {:.0}%", YELLOW, RESET, config.auto_sell_percent);
-    println!("{}Trade amount:{} {:.4} SOL", YELLOW, RESET, config.trade_amount_sol);
-    println!("{}Dry-run positions:{} {}", YELLOW, RESET, MAX_ACTIVE_DRY_RUN_POSITIONS);
     println!("{}Starting balance:{} {:.2} SOL{}\n", YELLOW, RESET, config.starting_sol_balance, RESET);
 }
 
@@ -541,13 +528,12 @@ fn parse_token_message(raw: &str) -> Option<Token> {
     let symbol = get_string(&value, &["symbol"]).unwrap_or_else(|| "N/A".to_string());
     let creator = get_string(&value, &["traderPublicKey", "creator", "creatorAddress", "creator_address"]).unwrap_or_else(|| "N/A".to_string());
     let bonding_curve = get_string(&value, &["bondingCurveKey", "bonding_curve"]).unwrap_or_else(|| "N/A".to_string());
-    let market_cap_sol = get_f64(&value, &["marketCapSol", "market_cap", "marketCap"]);
-    let market_cap = market_cap_sol.map(format_market_cap).unwrap_or_else(|| "N/A".to_string());
+    let market_cap = get_f64(&value, &["marketCapSol", "market_cap", "marketCap"]).map(format_market_cap).unwrap_or_else(|| "N/A".to_string());
     let initial_buy = get_f64(&value, &["initialBuy"]).map(format_initial_buy).unwrap_or_else(|| "N/A".to_string());
     let bonding_sol = get_f64(&value, &["solAmount"]).map(|v| format!("{:.4} SOL", v)).unwrap_or_else(|| "N/A".to_string());
     let metadata = get_string(&value, &["uri", "metadata"]).unwrap_or_else(|| "N/A".to_string());
     let pump_url = format!("https://pump.fun/coin/{}", mint);
-    let _solscan_url = format!("https://solscan.io/token/{}", mint);
+    let solscan_url = format!("https://solscan.io/token/{}", mint);
     let chart_url = format!("https://dexscreener.com/solana/{}", mint);
 
     Some(Token {
@@ -557,12 +543,12 @@ fn parse_token_message(raw: &str) -> Option<Token> {
         creator,
         bonding_curve,
         market_cap,
-        market_cap_sol,
         initial_buy,
         bonding_sol,
         metadata,
         pump_url,
         chart_url,
+        solscan_url,
     })
 }
 
@@ -573,21 +559,22 @@ struct Token {
     creator: String,
     bonding_curve: String,
     market_cap: String,
-    market_cap_sol: Option<f64>,
     initial_buy: String,
     bonding_sol: String,
     metadata: String,
     pump_url: String,
     chart_url: String,
+    solscan_url: String,
 }
 
 impl Token {
     #[allow(dead_code)]
     fn _unused_debug_fields(&self) {
-        let _ = (&self.creator, &self.bonding_curve, &self.initial_buy, &self.bonding_sol, &self.metadata, &self.chart_url);
+        let _ = (&self.creator, &self.bonding_curve, &self.initial_buy, &self.bonding_sol, &self.metadata, &self.chart_url, &self.solscan_url);
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct Position {
     mint: String,
@@ -596,7 +583,6 @@ struct Position {
     chart_url: String,
     snip_url: String,
     entry_sol: f64,
-    entry_market_cap_sol: f64,
     last_pct: f64,
     last_sol: f64,
 }
@@ -610,6 +596,7 @@ struct BotStatus {
     mode: String,
 }
 
+#[allow(dead_code)]
 fn wallet_connected() -> bool {
     !std::env::var("PRIVATE_KEY").unwrap_or_default().trim().is_empty()
 }
@@ -618,16 +605,241 @@ fn build_bot_status(config: TradingConfig, balance_sol: f64) -> BotStatus {
     BotStatus {
         active: true,
         balance_sol,
-        buy_amount_sol: config.trade_amount_sol,
+        buy_amount_sol: 0.1,
         slippage_pct: config.slippage_pct,
         priority_fee_sol: config.gas_priority_sol,
-        mode: "PUMPFUN DRY RUN — NO TRANSACTIONS".to_string(),
+        mode: "PUMPFUN".to_string(),
     }
 }
 
 fn real_trade_ready_for_auto_buy(balance_sol: f64, buy_amount_sol: f64, priority_fee_sol: f64) -> bool {
     let required = buy_amount_sol + priority_fee_sol + 0.001;
     balance_sol >= required
+}
+
+fn real_trade_enabled() -> bool {
+    std::env::var("ENABLE_REAL_TX")
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("true")
+}
+
+async fn get_jupiter_quote(
+    input_mint: &str,
+    output_mint: &str,
+    amount: u64,
+    slippage_bps: u16,
+) -> Result<Value, Box<dyn Error>> {
+    let url = format!(
+        "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}&onlyDirectRoutes=true&asLegacyTransaction=false",
+        input_mint, output_mint, amount, slippage_bps
+    );
+
+    let response = reqwest::Client::new().get(&url).send().await?;
+    let payload: Value = response.json().await?;
+
+    if payload.get("error").is_some() {
+        let message = payload.get("error").and_then(|v| v.as_str()).unwrap_or("unknown Jupiter error");
+        return Err(format!("Jupiter quote error: {}", message).into());
+    }
+
+    Ok(payload)
+}
+
+async fn sign_and_send_jupiter_swap(
+    keypair: &solana_sdk::signature::Keypair,
+    rpc_url: &str,
+    swap_transaction_b64: &str,
+) -> Result<String, Box<dyn Error>> {
+    let tx_bytes = base64::engine::general_purpose::STANDARD.decode(swap_transaction_b64)?;
+    let tx: VersionedTransaction = bincode::deserialize(&tx_bytes)?;
+    let signed_tx = VersionedTransaction::try_new(tx.message.clone(), &[keypair])?;
+    let tx_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&signed_tx)?);
+
+    let response = reqwest::Client::new()
+        .post(rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                tx_b64,
+                {
+                    "skipPreflight": false,
+                    "preflightCommitment": "confirmed",
+                    "encoding": "base64"
+                }
+            ]
+        }))
+        .send()
+        .await?;
+
+    let payload: Value = response.json().await?;
+    let signature = payload
+        .get("result")
+        .and_then(|v| v.as_str())
+        .ok_or("Jupiter swap did not return a transaction signature")?;
+
+    Ok(signature.to_string())
+}
+
+async fn execute_real_buy_token(token: &Token) -> Result<String, Box<dyn Error>> {
+    let private_key = std::env::var("PRIVATE_KEY")?;
+    let keypair = load_keypair_from_private_key(&private_key)
+        .ok_or("PRIVATE_KEY is not a valid base58 Solana key")?;
+    let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+
+    let buy_amount_lamports = (TRADE_AMOUNT_SOL * 1_000_000_000.0) as u64;
+    let quote = get_jupiter_quote(
+        "So11111111111111111111111111111111111111112",
+        &token.mint,
+        buy_amount_lamports,
+        (SLIPPAGE_PCT * 100.0) as u16,
+    ).await?;
+
+    let response = reqwest::Client::new()
+        .post("https://quote-api.jup.ag/v6/swap")
+        .json(&json!({
+            "quoteResponse": quote,
+            "userPublicKey": keypair.pubkey().to_string(),
+            "wrapAndUnwrapSol": true,
+            "dynamicComputeUnitLimit": true,
+            "prioritizationFeeLamports": "auto"
+        }))
+        .send()
+        .await?;
+
+    let payload: Value = response.json().await?;
+    let tx_b64 = payload
+        .get("swapTransaction")
+        .and_then(|v| v.as_str())
+        .ok_or("Jupiter swap endpoint did not return a swapTransaction")?;
+
+    let signature = sign_and_send_jupiter_swap(&keypair, &rpc_url, tx_b64).await?;
+    println!("{}REAL BUY SENT:{} {}{}", CYAN, RESET, GREEN, signature);
+    Ok(signature)
+}
+
+async fn get_token_account_amount(owner: &str, mint: &str, rpc_url: &str) -> Result<u64, Box<dyn Error>> {
+    let response = reqwest::Client::new()
+        .post(rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                owner,
+                {
+                    "mint": mint
+                },
+                {
+                    "encoding": "jsonParsed",
+                    "commitment": "confirmed"
+                }
+            ]
+        }))
+        .send()
+        .await?;
+
+    let payload: Value = response.json().await?;
+    let amount = payload
+        .get("result")
+        .and_then(|v| v.get("value"))
+        .and_then(|v| v.as_array())
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("account"))
+        .and_then(|acc| acc.get("data"))
+        .and_then(|data| data.get("parsed"))
+        .and_then(|parsed| parsed.get("info"))
+        .and_then(|info| info.get("tokenAmount"))
+        .and_then(|token_amount| token_amount.get("amount"))
+        .and_then(|amount| amount.as_str())
+        .ok_or("Could not resolve token account amount for sell")?;
+
+    Ok(amount.parse::<u64>()?)
+}
+
+async fn execute_real_sell_token(token_mint: &str) -> Result<String, Box<dyn Error>> {
+    let private_key = std::env::var("PRIVATE_KEY")?;
+    let keypair = load_keypair_from_private_key(&private_key)
+        .ok_or("PRIVATE_KEY is not a valid base58 Solana key")?;
+    let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    let owner = keypair.pubkey().to_string();
+    let token_amount = get_token_account_amount(&owner, token_mint, &rpc_url).await?;
+    if token_amount == 0 {
+        return Err(format!("No token balance found for sell of {}", token_mint).into());
+    }
+
+    let quote = get_jupiter_quote(token_mint, "So11111111111111111111111111111111111111112", token_amount, (SLIPPAGE_PCT * 100.0) as u16).await?;
+    let response = reqwest::Client::new()
+        .post("https://quote-api.jup.ag/v6/swap")
+        .json(&json!({
+            "quoteResponse": quote,
+            "userPublicKey": keypair.pubkey().to_string(),
+            "wrapAndUnwrapSol": true,
+            "dynamicComputeUnitLimit": true,
+            "prioritizationFeeLamports": "auto"
+        }))
+        .send()
+        .await?;
+
+    let payload: Value = response.json().await?;
+    let tx_b64 = payload
+        .get("swapTransaction")
+        .and_then(|v| v.as_str())
+        .ok_or("Jupiter sell endpoint did not return a swapTransaction")?;
+
+    let signature = sign_and_send_jupiter_swap(&keypair, &rpc_url, tx_b64).await?;
+    println!("{}REAL SELL SENT:{} {}{}", CYAN, RESET, GREEN, signature);
+    Ok(signature)
+}
+
+async fn run_real_trade_cycle(token: &Token) {
+    if let Err(err) = execute_real_buy_token(token).await {
+        eprintln!("{}REAL BUY FAILED:{} {}{}", RED, RESET, YELLOW, err);
+        return;
+    }
+
+    let mut attempts = 0usize;
+    loop {
+        if attempts >= 120 {
+            break;
+        }
+
+        sleep(Duration::from_secs(5)).await;
+        attempts += 1;
+
+        let keypair = match load_keypair_from_private_key(&std::env::var("PRIVATE_KEY").unwrap_or_default()) {
+            Some(k) => k,
+            None => break,
+        };
+
+        let owner = keypair.pubkey().to_string();
+        let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+        let token_amount = match get_token_account_amount(&owner, &token.mint, &rpc_url).await {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        if token_amount == 0 {
+            break;
+        }
+
+        let quote = match get_jupiter_quote(&token.mint, "So11111111111111111111111111111111111111112", token_amount, 250).await {
+            Ok(q) => q,
+            Err(_) => continue,
+        };
+
+        let out_amount = quote.get("outAmount").and_then(|v| v.as_str()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let entry_lamports = (TRADE_AMOUNT_SOL * 1_000_000_000.0) as u64;
+        if out_amount > 0 && entry_lamports > 0 {
+            let pnl_pct = ((out_amount as f64 / entry_lamports as f64) - 1.0) * 100.0;
+            if pnl_pct >= 50.0 {
+                if let Err(err) = execute_real_sell_token(&token.mint).await {
+                    eprintln!("{}REAL SELL FAILED:{} {}{}", RED, RESET, YELLOW, err);
+                }
+                break;
+            }
+        }
+    }
 }
 
 fn print_bot_status(status: &BotStatus) {
@@ -643,86 +855,151 @@ fn print_bot_status(status: &BotStatus) {
     println!("{}WALLET:{} {:.4} SOL{}\n", YELLOW, RESET, status.balance_sol, RESET);
 }
 
-async fn subscribe_to_token_trades<S>(ws_stream: &mut S, mint: &str) -> Result<(), Box<dyn Error>>
-where
-    S: futures_util::Sink<Message> + Unpin,
-    S::Error: Error + 'static,
-{
-    let subscription = json!({ "method": "subscribeTokenTrade", "keys": [mint] });
-    ws_stream.send(Message::Text(subscription.to_string().into())).await?;
-    println!("[{}] {}DRY RUN: subscribed to live trades for {}{}", timestamp(), CYAN, mint, RESET);
-    Ok(())
+async fn print_token(token: Token) {
+    if !should_trade_pump_token(&token) {
+        return;
+    }
+
+    if !record_trade_entry_if_needed(&token) {
+        return;
+    }
+
+    if !real_trade_enabled() {
+        print_migration_card(&token);
+        println!("{}{}⏳ DRY RUN: waiting for pool to settle...{}", BOLD, YELLOW, RESET);
+        println!("{}{}⚡ DRY RUN → simulated buy of {}{:.1} SOL{}...{}", BOLD, YELLOW, GREEN, TRADE_AMOUNT_SOL, YELLOW, RESET);
+        println!("{}{}✓ DRY RUN ONLY — no real transaction sent{}", BOLD, GREEN, RESET);
+        println!("  {}↳{} {}{}{}", WHITE, RESET, BLUE, token.solscan_url, RESET);
+        println!();
+        println!("{}{}💎 MONITORING{}", BOLD, CYAN, RESET);
+        println!("{}{}{}", WHITE, MONITOR_LINE, RESET);
+        println!(
+            "[{}] {}{}{} | SOL {}+0.0000{} | MCap {}{}{} | {}+0.00%{}",
+            timestamp(), WHITE, clean_terminal_text(&token.name), RESET,
+            GREEN, RESET,
+            WHITE, token.market_cap, RESET,
+            GREEN, RESET,
+        );
+        return;
+    }
+
+    let wallet_balance = match load_wallet_info().await {
+        Some(info) => info.balance_sol,
+        None => 0.0,
+    };
+
+    if !real_trade_ready_for_auto_buy(wallet_balance, TRADE_AMOUNT_SOL, GAS_PRIORITY_SOL) {
+        print_migration_card(&token);
+        println!("{}{}⏳ LIVE MODE: insufficient wallet balance for real trade...{}", BOLD, YELLOW, RESET);
+        println!("{}{}⚠️ LIVE BUY BLOCKED: needs {:.4} SOL, wallet has {:.4} SOL{}", BOLD, RED, TRADE_AMOUNT_SOL + GAS_PRIORITY_SOL + 0.001, wallet_balance, RESET);
+        println!("  {}↳{} {}{}{}", WHITE, RESET, BLUE, token.solscan_url, RESET);
+        return;
+    }
+
+    print_migration_card(&token);
+    println!("{}{}⏳ LIVE MODE: buying token with real mainnet funds...{}", BOLD, YELLOW, RESET);
+    println!("{}{}⚡ LIVE BUY → real trade for {}{:.1} SOL{}...{}", BOLD, YELLOW, GREEN, TRADE_AMOUNT_SOL, YELLOW, RESET);
+    println!("{}{}✓ BUY ATTEMPT STARTED{}", BOLD, GREEN, RESET);
+    println!("  {}↳{} {}{}{}", WHITE, RESET, BLUE, token.solscan_url, RESET);
+    println!();
+    println!("{}{}💎 MONITORING{}", BOLD, CYAN, RESET);
+    println!("{}{}{}", WHITE, MONITOR_LINE, RESET);
+    println!(
+        "[{}] {}{}{} | SOL {}+0.0000{} | MCap {}{}{} | {}+0.00%{}",
+        timestamp(), WHITE, clean_terminal_text(&token.name), RESET,
+        GREEN, RESET,
+        WHITE, token.market_cap, RESET,
+        GREEN, RESET,
+    );
+
+    run_real_trade_cycle(&token).await;
 }
 
-fn start_dry_run_position(token: Token, config: TradingConfig) -> Option<String> {
-    if !should_trade_pump_token(&token) || !config.auto_buy_new_tokens {
-        return None;
-    }
+// ----------------------------
+// TOKEN BOX LAYOUT
+// ----------------------------
+// Edit these lines to change the green box shown for every detected migration.
+fn print_migration_card(token: &Token) {
+    let title = format!("{}{}{}{}  {}·{}  {}{}{}{}", BOLD, BLUE, MIGRATION_TITLE, RESET, WHITE, RESET, BOLD, GREEN, PLATFORM_TITLE, RESET);
+    let name = format!("{}{}Name{}   {}{} ({})", BOLD, GRAY, RESET, BOLD, clean_terminal_text(&token.name), clean_terminal_text(&token.symbol));
+    let mint = format!("{}{}Mint{}   {}{}{}{}", BOLD, GRAY, RESET, BOLD, CYAN, clean_terminal_text(&token.mint), RESET);
+    let chart = format!("{}{}Chart{}  {}{}{}{}", BOLD, GRAY, RESET, BOLD, BLUE, token.chart_url, RESET);
+    let width = [title.as_str(), name.as_str(), mint.as_str(), chart.as_str()]
+        .iter()
+        .map(|line| terminal_visible_len(line))
+        .max()
+        .unwrap_or(TOKEN_BOX_WIDTH)
+        .max(TOKEN_BOX_WIDTH)
+        .saturating_sub(1);
 
-    let entry_market_cap_sol = token.market_cap_sol?;
-    if entry_market_cap_sol <= 0.0 {
-        return None;
-    }
+    println!();
+    println!("{}{}┏{}┓{}", BOLD, GREEN, "━".repeat(width), RESET);
+    print_box_line(&title, width);
+    print_box_line(&name, width);
+    print_box_line(&mint, width);
+    print_box_line(&chart, width);
+    println!("{}{}┗{}┛{}", BOLD, GREEN, "━".repeat(width), RESET);
+}
 
+fn print_box_line(content: &str, width: usize) {
+    // `width` is the number of columns between the two corners. We reserve one
+    // column for the left gutter and trim the computed padding by one so the
+    // right border sits flush with the top/bottom border.
+    let spaces = width
+        .saturating_sub(terminal_visible_len(content))
+        .saturating_sub(1);
+    println!("{}{}┃{} {}{}{}{}{}{}┃{}", BOLD, GREEN, RESET, BOLD, content, RESET, " ".repeat(spaces), BOLD, GREEN, RESET);
+}
+
+fn clean_terminal_text(value: &str) -> String {
+    value.replace(['\n', '\r', '\x1b'], " ")
+}
+
+fn terminal_visible_len(value: &str) -> usize {
+    let mut len = 0;
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for end in chars.by_ref() {
+                if end.is_ascii_alphabetic() { break; }
+            }
+        } else {
+            // Emoji and East Asian-wide characters take two terminal columns.
+            len += if ch as u32 > 0xFF { 2 } else { 1 };
+        }
+    }
+    len
+}
+
+fn record_trade_entry_if_needed(token: &Token) -> bool {
     let mut positions = ACTIVE_POSITIONS.lock().unwrap();
-    if positions.len() >= MAX_ACTIVE_DRY_RUN_POSITIONS {
-        return None;
+    for pos in positions.iter() {
+        if pos.mint == token.mint {
+            return true;
+        }
     }
 
-    let mint = token.mint.clone();
-    println!("{}DRY-RUN BUY:{} would buy {:.4} SOL of {} ({}) at {:.4} SOL market cap", GREEN, RESET, config.trade_amount_sol, token.name, token.symbol, entry_market_cap_sol);
-    println!("{}TARGET:{} would sell 100% when estimated position value reaches {:.4} SOL", CYAN, RESET, config.trade_amount_sol * (1.0 + config.auto_sell_profit_pct / 100.0));
+    if !AUTO_BUY_NEW_TOKENS {
+        return false;
+    }
+
+    if token.name.is_empty() || token.mint.is_empty() || token.chart_url.is_empty() {
+        return false;
+    }
 
     positions.push(Position {
-        mint: token.mint,
-        name: token.name,
-        symbol: token.symbol,
-        chart_url: token.chart_url,
-        snip_url: token.pump_url,
-        entry_sol: config.trade_amount_sol,
-        entry_market_cap_sol,
+        mint: token.mint.clone(),
+        name: token.name.clone(),
+        symbol: token.symbol.clone(),
+        chart_url: token.chart_url.clone(),
+        snip_url: token.solscan_url.clone(),
+        entry_sol: TRADE_AMOUNT_SOL,
         last_pct: 0.0,
         last_sol: 0.0,
     });
 
-    Some(mint)
-}
-
-fn parse_market_cap_update(raw: &str) -> Option<(String, f64)> {
-    let value: Value = serde_json::from_str(raw).ok()?;
-    if value.get("txType").and_then(|v| v.as_str()) == Some("create") {
-        return None;
-    }
-
-    let mint = get_string(&value, &["mint"])?;
-    let market_cap_sol = get_f64(&value, &["marketCapSol", "market_cap", "marketCap"])?;
-    (market_cap_sol > 0.0).then_some((mint, market_cap_sol))
-}
-
-fn update_dry_run_position(mint: &str, market_cap_sol: f64, config: TradingConfig) {
-    let mut positions = ACTIVE_POSITIONS.lock().unwrap();
-    let Some(index) = positions.iter().position(|position| position.mint == mint) else {
-        return;
-    };
-
-    let position = &mut positions[index];
-    let estimated_value_sol = estimate_position_value(
-        position.entry_sol,
-        position.entry_market_cap_sol,
-        market_cap_sol,
-    );
-    position.last_sol = estimated_value_sol - position.entry_sol;
-    position.last_pct = (position.last_sol / position.entry_sol) * 100.0;
-
-    let color = if position.last_sol >= 0.0 { GREEN } else { RED };
-    let sign = if position.last_sol >= 0.0 { "+" } else { "-" };
-    println!("{}DRY-RUN MONITOR:{} {} | estimated value {:.4} SOL | P/L {}{}{:.4} SOL{}", CYAN, RESET, position.symbol, estimated_value_sol, color, sign, position.last_sol.abs(), RESET);
-
-    let target_value_sol = take_profit_value(position.entry_sol, config.auto_sell_profit_pct);
-    if estimated_value_sol >= target_value_sol {
-        println!("{}DRY-RUN SELL:{} would sell 100% of {} at target {:.4} SOL | PROFIT +{:.4} SOL{}", GREEN, RESET, position.symbol, target_value_sol, target_value_sol - position.entry_sol, RESET);
-        positions.remove(index);
-    }
+    true
 }
 
 #[allow(dead_code)]
@@ -761,13 +1038,15 @@ fn print_sell_summary(change_sol: f64) {
     }
 }
 
-fn estimate_trade_delta(token: &Token, entry_sol: f64) -> (f64, f64) {
+#[allow(dead_code)]
+fn estimate_trade_delta(token: &Token) -> (f64, f64) {
     let market_cap = parse_market_cap_value(&token.market_cap);
     let raw_delta = ((market_cap - 30.0) / 30.0) * 100.0;
-    let delta_sol = (raw_delta / 100.0) * entry_sol;
+    let delta_sol = (raw_delta / 100.0) * 0.1;
     (raw_delta, delta_sol)
 }
 
+#[allow(dead_code)]
 fn parse_market_cap_value(raw: &str) -> f64 {
     let cleaned = raw.trim().replace(" SOL", "").replace(",", "");
     cleaned.parse::<f64>().unwrap_or(30.0)
@@ -785,18 +1064,6 @@ fn should_trade_pump_token(token: &Token) -> bool {
 fn should_sell_position(current_value_sol: f64, entry_sol: f64, profit_pct: f64) -> bool {
     let profit = ((current_value_sol - entry_sol) / entry_sol.max(0.000001)) * 100.0;
     profit >= profit_pct
-}
-
-fn estimate_position_value(entry_sol: f64, entry_market_cap_sol: f64, current_market_cap_sol: f64) -> f64 {
-    if entry_market_cap_sol <= 0.0 || current_market_cap_sol < 0.0 {
-        return 0.0;
-    }
-
-    entry_sol * current_market_cap_sol / entry_market_cap_sol
-}
-
-fn take_profit_value(entry_sol: f64, profit_pct: f64) -> f64 {
-    entry_sol * (1.0 + profit_pct / 100.0)
 }
 
 fn timestamp() -> String {
@@ -849,20 +1116,4 @@ fn get_f64(value: &Value, keys: &[&str]) -> Option<f64> {
         }
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{estimate_position_value, take_profit_value};
-
-    #[test]
-    fn a_half_gain_on_a_tenth_sol_trade_reaches_point_one_five_sol() {
-        assert!((take_profit_value(0.1, 50.0) - 0.15).abs() < 1e-12);
-        assert!((estimate_position_value(0.1, 30.0, 45.0) - 0.15).abs() < 1e-12);
-    }
-
-    #[test]
-    fn an_invalid_entry_market_cap_cannot_create_a_fake_value() {
-        assert_eq!(estimate_position_value(0.1, 0.0, 45.0), 0.0);
-    }
 }

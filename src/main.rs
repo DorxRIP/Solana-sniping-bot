@@ -81,8 +81,8 @@ const PUMP_TOKENS_ONLY: bool = true;
 const AUTO_BUY_NEW_TOKENS: bool = true;
 const AUTO_SELL_PROFIT_PCT: f64 = 50.0;
 const AUTO_SELL_PERCENT: f64 = 100.0;
-const STARTING_SOL_BALANCE: f64 = 2.0;
-const TRADE_AMOUNT_SOL: f64 = 0.1;
+const STARTING_SOL_BALANCE: f64 = 0.1;
+const TRADE_AMOUNT_SOL: f64 = 0.03;
 
 // ----------------------------
 // TOKEN LAYOUT SETTINGS

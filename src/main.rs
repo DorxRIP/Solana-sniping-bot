@@ -49,6 +49,7 @@ struct TradingConfig {
     auto_buy_new_tokens: bool,
     auto_sell_profit_pct: f64,
     auto_sell_percent: f64,
+    trade_amount_sol: f64,
     starting_sol_balance: f64,
 }
 
@@ -63,6 +64,7 @@ impl TradingConfig {
             auto_buy_new_tokens: AUTO_BUY_NEW_TOKENS,
             auto_sell_profit_pct: AUTO_SELL_PROFIT_PCT,
             auto_sell_percent: AUTO_SELL_PERCENT,
+            trade_amount_sol: TRADE_AMOUNT_SOL,
             starting_sol_balance: STARTING_SOL_BALANCE,
         }
     }
@@ -80,6 +82,9 @@ const PUMP_TOKENS_ONLY: bool = true;
 const AUTO_BUY_NEW_TOKENS: bool = true;
 const AUTO_SELL_PROFIT_PCT: f64 = 50.0;
 const AUTO_SELL_PERCENT: f64 = 100.0;
+// A 0.1 SOL trade at a 50% target realizes +0.05 SOL when 100% is sold.
+const TRADE_AMOUNT_SOL: f64 = 0.1;
+const MAX_ACTIVE_DRY_RUN_POSITIONS: usize = 1;
 const STARTING_SOL_BALANCE: f64 = 2.0;
 
 fn build_config() -> TradingConfig {
@@ -368,7 +373,7 @@ async fn main() {
 
     let private_key = std::env::var("PRIVATE_KEY").unwrap_or_else(|_| String::new());
     if private_key.is_empty() {
-        eprintln!("{}PRIVATE_KEY is missing. Add it to .env as PRIVATE_KEY=YOUR_KEY{}", RED, RESET);
+        println!("{}DRY RUN: private key is not required and no transactions will be sent.{}", CYAN, RESET);
     } else {
         println!("{}PRIVATE_KEY loaded from .env{}", GREEN, RESET);
     }
@@ -386,10 +391,7 @@ async fn main() {
         .unwrap_or_default()
         .eq_ignore_ascii_case("true")
     {
-        match send_real_devnet_tx_smoke_test().await {
-            Ok(_) => println!("{}DEVNET TX TEST COMPLETED{}", GREEN, RESET),
-            Err(err) => eprintln!("{}DEVNET TX TEST FAILED:{} {}{}", RED, RESET, YELLOW, err),
-        }
+        eprintln!("{}DRY RUN MODE: ENABLE_REAL_TX is ignored; no transaction will be sent.{}", YELLOW, RESET);
     }
 
     println!("{}EXECUTION GATES{}", CYAN, RESET);
@@ -426,8 +428,16 @@ async fn connect_and_listen(config: TradingConfig) -> Result<bool, Box<dyn Error
     println!("\n{}PUMP.FUN TOKEN SCANNER{}", YELLOW, RESET);
     println!("{}Real-time new token detection via PumpPortal{}\n", CYAN, RESET);
 
+    let pumpportal_api_key = std::env::var("PUMPPORTAL_API_KEY").unwrap_or_default();
+    let can_track_live_trades = !pumpportal_api_key.trim().is_empty();
+    let ws_url = if pumpportal_api_key.trim().is_empty() {
+        WS_URL.to_string()
+    } else {
+        format!("{WS_URL}?api-key={}", pumpportal_api_key.trim())
+    };
+
     println!("[{}] {}Connecting to PumpPortal WebSocket...{}", timestamp(), YELLOW, RESET);
-    let (mut ws_stream, _) = connect_async(WS_URL).await?;
+    let (mut ws_stream, _) = connect_async(&ws_url).await?;
 
     println!("[{}] {}Connected{}", timestamp(), GREEN, RESET);
     println!("[{}] {}Subscribing to new token events...{}", timestamp(), YELLOW, RESET);
@@ -451,7 +461,15 @@ async fn connect_and_listen(config: TradingConfig) -> Result<bool, Box<dyn Error
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Some(token) = parse_token_message(&text) {
-                            print_token(token);
+                            if let Some(mint) = start_dry_run_position(token, config) {
+                                if can_track_live_trades {
+                                    subscribe_to_token_trades(&mut ws_stream, &mint).await?;
+                                } else {
+                                    eprintln!("{}DRY RUN: PUMPPORTAL_API_KEY is missing; cannot monitor {} live.{}", YELLOW, mint, RESET);
+                                }
+                            }
+                        } else if let Some((mint, market_cap_sol)) = parse_market_cap_update(&text) {
+                            update_dry_run_position(&mint, market_cap_sol, config);
                         } else if text.contains("Successfully subscribed") {
                             println!("[{}] {}Subscribed — waiting for new tokens...{}", timestamp(), GREEN, RESET);
                         } else if text.contains("Invalid") || text.contains("error") || text.contains("Error") {
@@ -461,7 +479,15 @@ async fn connect_and_listen(config: TradingConfig) -> Result<bool, Box<dyn Error
                     Some(Ok(Message::Binary(bytes))) => {
                         let text = String::from_utf8_lossy(&bytes);
                         if let Some(token) = parse_token_message(&text) {
-                            print_token(token);
+                            if let Some(mint) = start_dry_run_position(token, config) {
+                                if can_track_live_trades {
+                                    subscribe_to_token_trades(&mut ws_stream, &mint).await?;
+                                } else {
+                                    eprintln!("{}DRY RUN: PUMPPORTAL_API_KEY is missing; cannot monitor {} live.{}", YELLOW, mint, RESET);
+                                }
+                            }
+                        } else if let Some((mint, market_cap_sol)) = parse_market_cap_update(&text) {
+                            update_dry_run_position(&mint, market_cap_sol, config);
                         }
                     }
                     Some(Ok(Message::Ping(_))) => {
@@ -494,6 +520,8 @@ fn print_trade_config(config: TradingConfig) {
     println!("{}Auto buy new tokens:{} {}", YELLOW, RESET, if config.auto_buy_new_tokens { "YES" } else { "NO" });
     println!("{}Auto sell profit:{} {:.0}%", YELLOW, RESET, config.auto_sell_profit_pct);
     println!("{}Auto sell amount:{} {:.0}%", YELLOW, RESET, config.auto_sell_percent);
+    println!("{}Trade amount:{} {:.4} SOL", YELLOW, RESET, config.trade_amount_sol);
+    println!("{}Dry-run positions:{} {}", YELLOW, RESET, MAX_ACTIVE_DRY_RUN_POSITIONS);
     println!("{}Starting balance:{} {:.2} SOL{}\n", YELLOW, RESET, config.starting_sol_balance, RESET);
 }
 
@@ -513,7 +541,8 @@ fn parse_token_message(raw: &str) -> Option<Token> {
     let symbol = get_string(&value, &["symbol"]).unwrap_or_else(|| "N/A".to_string());
     let creator = get_string(&value, &["traderPublicKey", "creator", "creatorAddress", "creator_address"]).unwrap_or_else(|| "N/A".to_string());
     let bonding_curve = get_string(&value, &["bondingCurveKey", "bonding_curve"]).unwrap_or_else(|| "N/A".to_string());
-    let market_cap = get_f64(&value, &["marketCapSol", "market_cap", "marketCap"]).map(format_market_cap).unwrap_or_else(|| "N/A".to_string());
+    let market_cap_sol = get_f64(&value, &["marketCapSol", "market_cap", "marketCap"]);
+    let market_cap = market_cap_sol.map(format_market_cap).unwrap_or_else(|| "N/A".to_string());
     let initial_buy = get_f64(&value, &["initialBuy"]).map(format_initial_buy).unwrap_or_else(|| "N/A".to_string());
     let bonding_sol = get_f64(&value, &["solAmount"]).map(|v| format!("{:.4} SOL", v)).unwrap_or_else(|| "N/A".to_string());
     let metadata = get_string(&value, &["uri", "metadata"]).unwrap_or_else(|| "N/A".to_string());
@@ -528,6 +557,7 @@ fn parse_token_message(raw: &str) -> Option<Token> {
         creator,
         bonding_curve,
         market_cap,
+        market_cap_sol,
         initial_buy,
         bonding_sol,
         metadata,
@@ -543,6 +573,7 @@ struct Token {
     creator: String,
     bonding_curve: String,
     market_cap: String,
+    market_cap_sol: Option<f64>,
     initial_buy: String,
     bonding_sol: String,
     metadata: String,
@@ -565,6 +596,7 @@ struct Position {
     chart_url: String,
     snip_url: String,
     entry_sol: f64,
+    entry_market_cap_sol: f64,
     last_pct: f64,
     last_sol: f64,
 }
@@ -586,10 +618,10 @@ fn build_bot_status(config: TradingConfig, balance_sol: f64) -> BotStatus {
     BotStatus {
         active: true,
         balance_sol,
-        buy_amount_sol: 0.1,
+        buy_amount_sol: config.trade_amount_sol,
         slippage_pct: config.slippage_pct,
         priority_fee_sol: config.gas_priority_sol,
-        mode: "PUMPFUN".to_string(),
+        mode: "PUMPFUN DRY RUN — NO TRANSACTIONS".to_string(),
     }
 }
 
@@ -611,111 +643,86 @@ fn print_bot_status(status: &BotStatus) {
     println!("{}WALLET:{} {:.4} SOL{}\n", YELLOW, RESET, status.balance_sol, RESET);
 }
 
-fn print_token(token: Token) {
-    if !wallet_connected() {
-        println!("{}WALLET STATUS:{} PRIVATE KEY NOT SET - NO ACTIVE POSITIONS{}", RED, RESET, RESET);
-        return;
-    }
-
-    if !should_trade_pump_token(&token) {
-        return;
-    }
-
-    if !record_trade_entry_if_needed(&token) {
-        return;
-    }
-
-    let pnl = estimate_trade_delta(&token);
-    let mut positions = ACTIVE_POSITIONS.lock().unwrap();
-    let mut found = false;
-
-    for pos in positions.iter_mut() {
-        if pos.mint == token.mint {
-            pos.last_pct = pnl.0;
-            pos.last_sol = pnl.1;
-            pos.chart_url = token.chart_url.clone();
-            pos.snip_url = token.pump_url.clone();
-            pos.name = token.name.clone();
-            pos.symbol = token.symbol.clone();
-            found = true;
-        }
-    }
-
-    if !found {
-        return;
-    }
-
-    let mut to_remove: Vec<usize> = Vec::new();
-    for (idx, pos) in positions.iter().enumerate() {
-        if pos.last_pct >= 50.0 {
-            to_remove.push(idx);
-            println!("{}SELL RESULT:{} {}PROFIT +{:.4} SOL{}", GREEN, RESET, GREEN, pos.last_sol, RESET);
-        }
-    }
-
-    for idx in to_remove.iter().rev() {
-        positions.remove(*idx);
-    }
-
-    if positions.is_empty() {
-        println!("{}NO ACTIVE TOKENS{}", YELLOW, RESET);
-        return;
-    }
-
-    let mut total_pct = 0.0f64;
-    let mut total_sol = 0.0f64;
-
-    println!("\n{}════════ ACTIVE TOKENS ════════{}", CYAN, RESET);
-    for pos in positions.iter() {
-        total_pct += pos.last_pct;
-        total_sol += pos.last_sol;
-
-        let color = if pos.last_pct >= 0.0 { GREEN } else { RED };
-        let sign = if pos.last_pct >= 0.0 { "+" } else { "-" };
-
-        println!("{}Name:{} {}{}", YELLOW, RESET, WHITE, pos.name);
-        println!("{}Mint:{} {}{}", YELLOW, RESET, CYAN, pos.mint);
-        println!("{}Chart:{} {}{}", YELLOW, RESET, BLUE, pos.chart_url);
-        println!("{}Snip:{} {}{}", YELLOW, RESET, GREEN, pos.snip_url);
-        println!("{}Entry:{} {:.4} SOL{}", YELLOW, RESET, pos.entry_sol, RESET);
-        println!("{}P/L:{} {}{}{}{} | {}{}{}{}", YELLOW, RESET, color, sign, pos.last_pct.abs(), RESET, color, sign, pos.last_sol.abs(), RESET);
-        println!("{}────────────────────────────────────────────────────{}", CYAN, RESET);
-    }
-
-    let total_color = if total_pct >= 0.0 { GREEN } else { RED };
-    let total_sign = if total_pct >= 0.0 { "+" } else { "-" };
-    println!("{}FINAL:{} {}{}{}{} | {}{}{}{}", YELLOW, RESET, total_color, total_sign, total_pct.abs(), RESET, total_color, total_sign, total_sol.abs(), RESET);
-    println!("{}════════════════════════════════════════════════════════════{}\n", CYAN, RESET);
+async fn subscribe_to_token_trades<S>(ws_stream: &mut S, mint: &str) -> Result<(), Box<dyn Error>>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: Error + 'static,
+{
+    let subscription = json!({ "method": "subscribeTokenTrade", "keys": [mint] });
+    ws_stream.send(Message::Text(subscription.to_string().into())).await?;
+    println!("[{}] {}DRY RUN: subscribed to live trades for {}{}", timestamp(), CYAN, mint, RESET);
+    Ok(())
 }
 
-fn record_trade_entry_if_needed(token: &Token) -> bool {
+fn start_dry_run_position(token: Token, config: TradingConfig) -> Option<String> {
+    if !should_trade_pump_token(&token) || !config.auto_buy_new_tokens {
+        return None;
+    }
+
+    let entry_market_cap_sol = token.market_cap_sol?;
+    if entry_market_cap_sol <= 0.0 {
+        return None;
+    }
+
     let mut positions = ACTIVE_POSITIONS.lock().unwrap();
-    for pos in positions.iter() {
-        if pos.mint == token.mint {
-            return true;
-        }
+    if positions.len() >= MAX_ACTIVE_DRY_RUN_POSITIONS {
+        return None;
     }
 
-    if !AUTO_BUY_NEW_TOKENS {
-        return false;
-    }
-
-    if token.name.is_empty() || token.mint.is_empty() || token.chart_url.is_empty() {
-        return false;
-    }
+    let mint = token.mint.clone();
+    println!("{}DRY-RUN BUY:{} would buy {:.4} SOL of {} ({}) at {:.4} SOL market cap", GREEN, RESET, config.trade_amount_sol, token.name, token.symbol, entry_market_cap_sol);
+    println!("{}TARGET:{} would sell 100% when estimated position value reaches {:.4} SOL", CYAN, RESET, config.trade_amount_sol * (1.0 + config.auto_sell_profit_pct / 100.0));
 
     positions.push(Position {
-        mint: token.mint.clone(),
-        name: token.name.clone(),
-        symbol: token.symbol.clone(),
-        chart_url: token.chart_url.clone(),
-        snip_url: token.pump_url.clone(),
-        entry_sol: 0.1,
+        mint: token.mint,
+        name: token.name,
+        symbol: token.symbol,
+        chart_url: token.chart_url,
+        snip_url: token.pump_url,
+        entry_sol: config.trade_amount_sol,
+        entry_market_cap_sol,
         last_pct: 0.0,
         last_sol: 0.0,
     });
 
-    true
+    Some(mint)
+}
+
+fn parse_market_cap_update(raw: &str) -> Option<(String, f64)> {
+    let value: Value = serde_json::from_str(raw).ok()?;
+    if value.get("txType").and_then(|v| v.as_str()) == Some("create") {
+        return None;
+    }
+
+    let mint = get_string(&value, &["mint"])?;
+    let market_cap_sol = get_f64(&value, &["marketCapSol", "market_cap", "marketCap"])?;
+    (market_cap_sol > 0.0).then_some((mint, market_cap_sol))
+}
+
+fn update_dry_run_position(mint: &str, market_cap_sol: f64, config: TradingConfig) {
+    let mut positions = ACTIVE_POSITIONS.lock().unwrap();
+    let Some(index) = positions.iter().position(|position| position.mint == mint) else {
+        return;
+    };
+
+    let position = &mut positions[index];
+    let estimated_value_sol = estimate_position_value(
+        position.entry_sol,
+        position.entry_market_cap_sol,
+        market_cap_sol,
+    );
+    position.last_sol = estimated_value_sol - position.entry_sol;
+    position.last_pct = (position.last_sol / position.entry_sol) * 100.0;
+
+    let color = if position.last_sol >= 0.0 { GREEN } else { RED };
+    let sign = if position.last_sol >= 0.0 { "+" } else { "-" };
+    println!("{}DRY-RUN MONITOR:{} {} | estimated value {:.4} SOL | P/L {}{}{:.4} SOL{}", CYAN, RESET, position.symbol, estimated_value_sol, color, sign, position.last_sol.abs(), RESET);
+
+    let target_value_sol = take_profit_value(position.entry_sol, config.auto_sell_profit_pct);
+    if estimated_value_sol >= target_value_sol {
+        println!("{}DRY-RUN SELL:{} would sell 100% of {} at target {:.4} SOL | PROFIT +{:.4} SOL{}", GREEN, RESET, position.symbol, target_value_sol, target_value_sol - position.entry_sol, RESET);
+        positions.remove(index);
+    }
 }
 
 #[allow(dead_code)]
@@ -754,10 +761,10 @@ fn print_sell_summary(change_sol: f64) {
     }
 }
 
-fn estimate_trade_delta(token: &Token) -> (f64, f64) {
+fn estimate_trade_delta(token: &Token, entry_sol: f64) -> (f64, f64) {
     let market_cap = parse_market_cap_value(&token.market_cap);
     let raw_delta = ((market_cap - 30.0) / 30.0) * 100.0;
-    let delta_sol = (raw_delta / 100.0) * 0.1;
+    let delta_sol = (raw_delta / 100.0) * entry_sol;
     (raw_delta, delta_sol)
 }
 
@@ -778,6 +785,18 @@ fn should_trade_pump_token(token: &Token) -> bool {
 fn should_sell_position(current_value_sol: f64, entry_sol: f64, profit_pct: f64) -> bool {
     let profit = ((current_value_sol - entry_sol) / entry_sol.max(0.000001)) * 100.0;
     profit >= profit_pct
+}
+
+fn estimate_position_value(entry_sol: f64, entry_market_cap_sol: f64, current_market_cap_sol: f64) -> f64 {
+    if entry_market_cap_sol <= 0.0 || current_market_cap_sol < 0.0 {
+        return 0.0;
+    }
+
+    entry_sol * current_market_cap_sol / entry_market_cap_sol
+}
+
+fn take_profit_value(entry_sol: f64, profit_pct: f64) -> f64 {
+    entry_sol * (1.0 + profit_pct / 100.0)
 }
 
 fn timestamp() -> String {
@@ -830,4 +849,20 @@ fn get_f64(value: &Value, keys: &[&str]) -> Option<f64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{estimate_position_value, take_profit_value};
+
+    #[test]
+    fn a_half_gain_on_a_tenth_sol_trade_reaches_point_one_five_sol() {
+        assert!((take_profit_value(0.1, 50.0) - 0.15).abs() < 1e-12);
+        assert!((estimate_position_value(0.1, 30.0, 45.0) - 0.15).abs() < 1e-12);
+    }
+
+    #[test]
+    fn an_invalid_entry_market_cap_cannot_create_a_fake_value() {
+        assert_eq!(estimate_position_value(0.1, 0.0, 45.0), 0.0);
+    }
 }

@@ -50,6 +50,7 @@ struct TradingConfig {
     auto_sell_profit_pct: f64,
     auto_sell_percent: f64,
     starting_sol_balance: f64,
+    trade_amount_sol: f64,
 }
 
 impl TradingConfig {
@@ -60,10 +61,11 @@ impl TradingConfig {
             slippage_pct: SLIPPAGE_PCT,
             mev_protection: MEV_PROTECTION,
             pump_tokens_only: PUMP_TOKENS_ONLY,
-            auto_buy_new_tokens: AUTO_BUY_NEW_TOKENS,
+            auto_buy_new_tokens: load_auto_buy_setting(),
             auto_sell_profit_pct: AUTO_SELL_PROFIT_PCT,
             auto_sell_percent: AUTO_SELL_PERCENT,
             starting_sol_balance: STARTING_SOL_BALANCE,
+            trade_amount_sol: TRADE_AMOUNT_SOL,
         }
     }
 }
@@ -78,10 +80,38 @@ const SLIPPAGE_PCT: f64 = 25.0;
 const MEV_PROTECTION: bool = false;
 const PUMP_TOKENS_ONLY: bool = true;
 const AUTO_BUY_NEW_TOKENS: bool = true;
-const AUTO_SELL_PROFIT_PCT: f64 = 50.0;
+const AUTO_SELL_PROFIT_PCT: f64 = 10.0;
 const AUTO_SELL_PERCENT: f64 = 100.0;
 const STARTING_SOL_BALANCE: f64 = 0.1;
 const TRADE_AMOUNT_SOL: f64 = 0.03;
+
+fn env_bool_setting(_name: &str, default: bool, value: &str) -> bool {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" | "" => false,
+        _ => default,
+    }
+}
+
+fn load_auto_buy_setting() -> bool {
+    let env_value = std::env::var("AUTO_BUY_NEW_TOKENS").unwrap_or_default();
+    env_bool_setting("AUTO_BUY_NEW_TOKENS", AUTO_BUY_NEW_TOKENS, &env_value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_bool_setting_respects_true_and_false_values() {
+        assert!(env_bool_setting("AUTO_BUY_NEW_TOKENS", true, "true"));
+        assert!(env_bool_setting("AUTO_BUY_NEW_TOKENS", true, "yes"));
+        assert!(env_bool_setting("AUTO_BUY_NEW_TOKENS", false, "1"));
+        assert!(!env_bool_setting("AUTO_BUY_NEW_TOKENS", true, "false"));
+        assert!(!env_bool_setting("AUTO_BUY_NEW_TOKENS", false, "0"));
+        assert!(!env_bool_setting("AUTO_BUY_NEW_TOKENS", false, "no"));
+    }
+}
 
 // ----------------------------
 // TOKEN LAYOUT SETTINGS
@@ -465,7 +495,7 @@ async fn connect_and_listen(config: TradingConfig) -> Result<bool, Box<dyn Error
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Some(token) = parse_token_message(&text) {
-                            print_token(token).await;
+                            print_token(&config, token).await;
                         } else if text.contains("Successfully subscribed") {
                             println!("[{}] {}Subscribed — waiting for new tokens...{}", timestamp(), GREEN, RESET);
                         } else if text.contains("Invalid") || text.contains("error") || text.contains("Error") {
@@ -475,7 +505,7 @@ async fn connect_and_listen(config: TradingConfig) -> Result<bool, Box<dyn Error
                     Some(Ok(Message::Binary(bytes))) => {
                         let text = String::from_utf8_lossy(&bytes);
                         if let Some(token) = parse_token_message(&text) {
-                            print_token(token).await;
+                            print_token(&config, token).await;
                         }
                     }
                     Some(Ok(Message::Ping(_))) => {
@@ -508,6 +538,7 @@ fn print_trade_config(config: TradingConfig) {
     println!("{}Auto buy new tokens:{} {}", YELLOW, RESET, if config.auto_buy_new_tokens { "YES" } else { "NO" });
     println!("{}Auto sell profit:{} {:.0}%", YELLOW, RESET, config.auto_sell_profit_pct);
     println!("{}Auto sell amount:{} {:.0}%", YELLOW, RESET, config.auto_sell_percent);
+    println!("{}Trade amount:{} {:.2} SOL", YELLOW, RESET, config.trade_amount_sol);
     println!("{}Starting balance:{} {:.2} SOL{}\n", YELLOW, RESET, config.starting_sol_balance, RESET);
 }
 
@@ -602,7 +633,7 @@ fn build_bot_status(config: TradingConfig, balance_sol: f64) -> BotStatus {
     BotStatus {
         active: true,
         balance_sol,
-        buy_amount_sol: 0.1,
+        buy_amount_sol: config.trade_amount_sol,
         slippage_pct: config.slippage_pct,
         priority_fee_sol: config.gas_priority_sol,
         mode: "PUMPFUN".to_string(),
@@ -679,18 +710,18 @@ async fn sign_and_send_jupiter_swap(
     Ok(signature.to_string())
 }
 
-async fn execute_real_buy_token(token: &Token) -> Result<String, Box<dyn Error>> {
+async fn execute_real_buy_token(config: &TradingConfig, token: &Token) -> Result<String, Box<dyn Error>> {
     let private_key = std::env::var("PRIVATE_KEY")?;
     let keypair = load_keypair_from_private_key(&private_key)
         .ok_or("PRIVATE_KEY is not a valid base58 Solana key")?;
     let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
 
-    let buy_amount_lamports = (TRADE_AMOUNT_SOL * 1_000_000_000.0) as u64;
+    let buy_amount_lamports = (config.trade_amount_sol * 1_000_000_000.0) as u64;
     let quote = get_jupiter_quote(
         "So11111111111111111111111111111111111111112",
         &token.mint,
         buy_amount_lamports,
-        (SLIPPAGE_PCT * 100.0) as u16,
+        (config.slippage_pct * 100.0) as u16,
     ).await?;
 
     let response = reqwest::Client::new()
@@ -790,8 +821,8 @@ async fn execute_real_sell_token(token_mint: &str) -> Result<String, Box<dyn Err
     Ok(signature)
 }
 
-async fn run_real_trade_cycle(token: &Token) {
-    if let Err(err) = execute_real_buy_token(token).await {
+async fn run_real_trade_cycle(config: &TradingConfig, token: &Token) {
+    if let Err(err) = execute_real_buy_token(config, token).await {
         eprintln!("{}REAL BUY FAILED:{} {}{}", RED, RESET, YELLOW, err);
         return;
     }
@@ -820,13 +851,13 @@ async fn run_real_trade_cycle(token: &Token) {
             break;
         }
 
-        let quote = match get_jupiter_quote(&token.mint, "So11111111111111111111111111111111111111112", token_amount, 250).await {
+        let quote = match get_jupiter_quote(&token.mint, "So11111111111111111111111111111111111111112", token_amount, (config.slippage_pct * 100.0) as u16).await {
             Ok(q) => q,
             Err(_) => continue,
         };
 
         let out_amount = quote.get("outAmount").and_then(|v| v.as_str()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-        let entry_lamports = (TRADE_AMOUNT_SOL * 1_000_000_000.0) as u64;
+        let entry_lamports = (config.trade_amount_sol * 1_000_000_000.0) as u64;
         if out_amount > 0 && entry_lamports > 0 {
             let pnl_pct = ((out_amount as f64 / entry_lamports as f64) - 1.0) * 100.0;
             if pnl_pct >= 50.0 {
@@ -852,19 +883,19 @@ fn print_bot_status(status: &BotStatus) {
     println!("{}WALLET:{} {:.4} SOL{}\n", YELLOW, RESET, status.balance_sol, RESET);
 }
 
-async fn print_token(token: Token) {
+async fn print_token(config: &TradingConfig, token: Token) {
     if !should_trade_pump_token(&token) {
         return;
     }
 
-    if !record_trade_entry_if_needed(&token) {
+    if !record_trade_entry_if_needed(config, &token) {
         return;
     }
 
     if !real_trade_enabled() {
         print_migration_card(&token);
         println!("{}{}⏳ DRY RUN: waiting for pool to settle...{}", BOLD, YELLOW, RESET);
-        println!("{}{}⚡ DRY RUN → simulated buy of {}{:.1} SOL{}...{}", BOLD, YELLOW, GREEN, TRADE_AMOUNT_SOL, YELLOW, RESET);
+        println!("{}{}⚡ DRY RUN → simulated buy of {}{:.1} SOL{}...{}", BOLD, YELLOW, GREEN, config.trade_amount_sol, YELLOW, RESET);
         println!("{}{}✓ DRY RUN ONLY — no real transaction sent{}", BOLD, GREEN, RESET);
         println!("  {}↳{} {}{}{}", WHITE, RESET, BLUE, token.solscan_url, RESET);
         println!();
@@ -885,17 +916,17 @@ async fn print_token(token: Token) {
         None => 0.0,
     };
 
-    if !real_trade_ready_for_auto_buy(wallet_balance, TRADE_AMOUNT_SOL, GAS_PRIORITY_SOL) {
+    if !real_trade_ready_for_auto_buy(wallet_balance, config.trade_amount_sol, config.gas_priority_sol) {
         print_migration_card(&token);
         println!("{}{}⏳ LIVE MODE: insufficient wallet balance for real trade...{}", BOLD, YELLOW, RESET);
-        println!("{}{}⚠️ LIVE BUY BLOCKED: needs {:.4} SOL, wallet has {:.4} SOL{}", BOLD, RED, TRADE_AMOUNT_SOL + GAS_PRIORITY_SOL + 0.001, wallet_balance, RESET);
+        println!("{}{}⚠️ LIVE BUY BLOCKED: needs {:.4} SOL, wallet has {:.4} SOL{}", BOLD, RED, config.trade_amount_sol + config.gas_priority_sol + 0.001, wallet_balance, RESET);
         println!("  {}↳{} {}{}{}", WHITE, RESET, BLUE, token.solscan_url, RESET);
         return;
     }
 
     print_migration_card(&token);
     println!("{}{}⏳ LIVE MODE: buying token with real mainnet funds...{}", BOLD, YELLOW, RESET);
-    println!("{}{}⚡ LIVE BUY → real trade for {}{:.1} SOL{}...{}", BOLD, YELLOW, GREEN, TRADE_AMOUNT_SOL, YELLOW, RESET);
+    println!("{}{}⚡ LIVE BUY → real trade for {}{:.1} SOL{}...{}", BOLD, YELLOW, GREEN, config.trade_amount_sol, YELLOW, RESET);
     println!("{}{}✓ BUY ATTEMPT STARTED{}", BOLD, GREEN, RESET);
     println!("  {}↳{} {}{}{}", WHITE, RESET, BLUE, token.solscan_url, RESET);
     println!();
@@ -909,7 +940,7 @@ async fn print_token(token: Token) {
         GREEN, RESET,
     );
 
-    run_real_trade_cycle(&token).await;
+    run_real_trade_cycle(config, &token).await;
 }
 
 // ----------------------------
@@ -969,7 +1000,7 @@ fn terminal_visible_len(value: &str) -> usize {
     len
 }
 
-fn record_trade_entry_if_needed(token: &Token) -> bool {
+fn record_trade_entry_if_needed(config: &TradingConfig, token: &Token) -> bool {
     let mut positions = ACTIVE_POSITIONS.lock().unwrap();
     for pos in positions.iter() {
         if pos.mint == token.mint {
@@ -977,7 +1008,7 @@ fn record_trade_entry_if_needed(token: &Token) -> bool {
         }
     }
 
-    if !AUTO_BUY_NEW_TOKENS {
+    if !config.auto_buy_new_tokens {
         return false;
     }
 
@@ -991,7 +1022,7 @@ fn record_trade_entry_if_needed(token: &Token) -> bool {
         symbol: token.symbol.clone(),
         chart_url: token.chart_url.clone(),
         snip_url: token.solscan_url.clone(),
-        entry_sol: TRADE_AMOUNT_SOL,
+        entry_sol: config.trade_amount_sol,
         last_pct: 0.0,
         last_sol: 0.0,
     });

@@ -1,1116 +1,1174 @@
+// Minimal Pump.fun sniper.
+// Uses PumpPortal WebSocket for new-token, migration, and trade data.
+// Uses PumpPortal Local Transaction API for transaction construction.
+// PRIVATE_KEY, RPC_URL and PUMPPORTAL_API_KEY stay in .env.
+//
+// Trade-behavior settings (AUTO_BUY_NEW_TOKENS, TRADE_AMOUNT_SOL, etc.) are
+// re-read from the .env file on disk every ~750ms. Edit and save the file
+// while the bot is running and changes apply automatically — no restart
+// needed. PRIVATE_KEY / RPC_URL / PUMPPORTAL_API_KEY are NOT hot-reloaded
+// (changing those still needs a restart, since they affect the live
+// websocket connection and signing key).
+
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use solana_sdk::hash::Hash;
-use solana_sdk::message::Message as SolanaMessage;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signer::{SeedDerivable, Signer};
-use solana_sdk::system_instruction;
-use solana_sdk::transaction::{Transaction, VersionedTransaction};
-use std::error::Error;
-use std::str::FromStr;
-use std::sync::atomic::AtomicUsize;
-use std::sync::{LazyLock, Mutex};
-use tokio::time::{sleep, Duration};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use solana_sdk::{
+    signature::{Keypair, SeedDerivable, Signer},
+    transaction::VersionedTransaction,
+};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    error::Error,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tokio::{
+    io::{self, AsyncBufReadExt, BufReader},
+    sync::{mpsc, Mutex, RwLock},
+    time::sleep,
+};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-const WS_URL: &str = "wss://pumpportal.fun/api/data";
-const RECONNECT_DELAY: Duration = Duration::from_secs(4);
+const PUMPPORTAL_WS: &str = "wss://pumpportal.fun/api/data";
+const PUMPPORTAL_LOCAL_TX: &str = "https://pumpportal.fun/api/trade-local";
+const JITO_BUNDLE_URL: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
 
-#[allow(dead_code)]
-static TOKEN_COUNT: AtomicUsize = AtomicUsize::new(1);
-static ACTIVE_POSITIONS: LazyLock<Mutex<Vec<Position>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+const AUTO_BUY_DEFAULT: bool = true;
+const TRADE_AMOUNT_DEFAULT: f64 = 0.03;
+const MAX_TOKEN_AGE_DEFAULT: u64 = 1_000;
+const AUTO_SELL_PROFIT_DEFAULT: f64 = 25.0;
+const SLIPPAGE_DEFAULT: f64 = 25.0;
+const PRIORITY_FEE_DEFAULT: f64 = 0.0002;
+const MEV_PROTECTION_DEFAULT: bool = false;
+const PUMP_ONLY_DEFAULT: bool = true;
+const MIN_SOL_RESERVE_DEFAULT: f64 = 0.01;
 
+// ---- terminal styling (no extra crates needed) ----
 const RESET: &str = "\x1b[0m";
-const GREEN: &str = "\x1b[32m";
-const CYAN: &str = "\x1b[36m";
-const YELLOW: &str = "\x1b[33m";
-const BLUE: &str = "\x1b[34m";
-const WHITE: &str = "\x1b[37m";
-const GRAY: &str = "\x1b[90m";
-const RED: &str = "\x1b[31m";
 const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+const UNDERLINE: &str = "\x1b[4m";
+const GREEN: &str = "\x1b[32m";
+const RED: &str = "\x1b[31m";
+const YELLOW: &str = "\x1b[33m";
+const CYAN: &str = "\x1b[36m";
 
-const PUMP_ASCII: &str = r#" ______   __  __   ___ __ __   ______
-/_____ /\ /_/\/_/\ /__//_//_/\ /_____ /\
-\:::_ \ \\:\ \:\ \\::\| \| \ \\:::_ \ \
- \:(_) \ \\:\ \:\ \\:.      \ \\:(_) \ \
-  \: ___\/ \:\ \:\ \\:.\-/\  \ \\: ___\/
-   \ \ \    \:\_\:\ \ . \  \  \ \\ \ \   
-    \_\/     \_____\/ \__\/ \__\/ \_\/   "#;
-
-#[derive(Clone, Copy, Debug)]
-struct TradingConfig {
-    gas_priority_sol: f64,
-    bribe_priority_sol: f64,
-    slippage_pct: f64,
-    mev_protection: bool,
-    pump_tokens_only: bool,
-    auto_buy_new_tokens: bool,
-    auto_sell_profit_pct: f64,
-    auto_sell_percent: f64,
-    starting_sol_balance: f64,
+/// Settings that stay fixed for the life of the process.
+#[derive(Clone)]
+struct Config {
+    rpc_url: String,
+    api_key: String,
+    auto_buy: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
 }
 
-impl TradingConfig {
-    fn defaults() -> Self {
-        Self {
-            gas_priority_sol: GAS_PRIORITY_SOL,
-            bribe_priority_sol: BRIBE_PRIORITY_SOL,
-            slippage_pct: SLIPPAGE_PCT,
-            mev_protection: MEV_PROTECTION,
-            pump_tokens_only: PUMP_TOKENS_ONLY,
-            auto_buy_new_tokens: AUTO_BUY_NEW_TOKENS,
-            auto_sell_profit_pct: AUTO_SELL_PROFIT_PCT,
-            auto_sell_percent: AUTO_SELL_PERCENT,
-            starting_sol_balance: STARTING_SOL_BALANCE,
+/// Settings that can change while the bot is running, reloaded from .env.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HotSettings {
+    trade_amount_sol: f64,
+    max_token_age_ms: u64,
+    auto_sell_profit_pct: f64,
+    slippage_pct: f64,
+    priority_fee_sol: f64,
+    mev_protection: bool,
+    pump_tokens_only: bool,
+    min_sol_reserve: f64,
+}
+
+#[derive(Clone)]
+struct App {
+    config: Config,
+    http: reqwest::Client,
+    keypair: Arc<Keypair>,
+    ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Message>>>>,
+    positions: Arc<RwLock<HashMap<String, Position>>>,
+    seen: Arc<Mutex<HashSet<String>>>,
+    migrated: Arc<Mutex<HashSet<String>>>,
+    hot: Arc<RwLock<HotSettings>>,
+    bought_count: Arc<AtomicU64>,
+    migration_count: Arc<AtomicU64>,
+    sol_balance: Arc<RwLock<Option<f64>>>,
+    env_path: Arc<PathBuf>,
+    print_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone)]
+struct Position {
+    mint: String,
+    entry_price_sol_per_token: f64,
+    selling: bool,
+}
+
+#[derive(Clone)]
+struct NewToken {
+    mint: String,
+    name: String,
+    symbol: String,
+    received_at: Instant,
+    source_timestamp_ms: Option<u64>,
+}
+
+#[derive(Clone)]
+struct TradeEvent {
+    mint: String,
+    tx_type: String,
+    trader: String,
+    sol_amount: f64,
+    token_amount: f64,
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let env_path: PathBuf = dotenv::dotenv().unwrap_or_else(|_| PathBuf::from(".env"));
+
+    let private_key = env::var("PRIVATE_KEY")
+        .map_err(|_| "PRIVATE_KEY is missing from .env")?;
+    let keypair = load_keypair(&private_key)?;
+
+    let rpc_url = env::var("RPC_URL")
+        .or_else(|_| env::var("SOLANA_RPC_URL"))
+        .map_err(|_| "RPC_URL or SOLANA_RPC_URL is missing from .env")?;
+
+    let api_key = env::var("PUMPPORTAL_API_KEY")
+        .map_err(|_| "PUMPPORTAL_API_KEY is required for live auto-buy and auto-sell tracking")?;
+
+    let auto_buy = Arc::new(AtomicBool::new(
+        env_bool("AUTO_BUY_NEW_TOKENS", AUTO_BUY_DEFAULT),
+    ));
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    let config = Config {
+        rpc_url,
+        api_key,
+        auto_buy: auto_buy.clone(),
+        shutdown: shutdown.clone(),
+    };
+
+    let initial_settings = HotSettings {
+        trade_amount_sol: env_f64("TRADE_AMOUNT_SOL", TRADE_AMOUNT_DEFAULT),
+        max_token_age_ms: env_u64("MAX_TOKEN_AGE_MS", MAX_TOKEN_AGE_DEFAULT),
+        auto_sell_profit_pct: env_f64("AUTO_SELL_PROFIT_PCT", AUTO_SELL_PROFIT_DEFAULT),
+        slippage_pct: env_f64("SLIPPAGE_PCT", SLIPPAGE_DEFAULT),
+        priority_fee_sol: env_f64("PRIORITY_FEE_SOL", PRIORITY_FEE_DEFAULT),
+        mev_protection: env_bool("MEV_PROTECTION", MEV_PROTECTION_DEFAULT),
+        pump_tokens_only: env_bool("PUMP_TOKENS_ONLY", PUMP_ONLY_DEFAULT),
+        min_sol_reserve: env_f64("MIN_SOL_RESERVE", MIN_SOL_RESERVE_DEFAULT),
+    };
+
+    if initial_settings.trade_amount_sol <= 0.0 {
+        return Err("TRADE_AMOUNT_SOL must be > 0".into());
+    }
+
+    if initial_settings.slippage_pct <= 0.0 || initial_settings.slippage_pct > 100.0 {
+        return Err("SLIPPAGE_PCT must be between 0 and 100".into());
+    }
+
+    if initial_settings.auto_sell_profit_pct < 0.0 {
+        return Err("AUTO_SELL_PROFIT_PCT must be >= 0".into());
+    }
+
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(500))
+        .timeout(Duration::from_secs(2))
+        .pool_max_idle_per_host(32)
+        .tcp_keepalive(Duration::from_secs(30))
+        .build()?;
+
+    let app = App {
+        config,
+        http,
+        keypair: Arc::new(keypair),
+        ws_tx: Arc::new(Mutex::new(None)),
+        positions: Arc::new(RwLock::new(HashMap::new())),
+        seen: Arc::new(Mutex::new(HashSet::new())),
+        migrated: Arc::new(Mutex::new(HashSet::new())),
+        hot: Arc::new(RwLock::new(initial_settings)),
+        bought_count: Arc::new(AtomicU64::new(0)),
+        migration_count: Arc::new(AtomicU64::new(0)),
+        sol_balance: Arc::new(RwLock::new(None)),
+        env_path: Arc::new(env_path),
+        print_lock: Arc::new(Mutex::new(())),
+    };
+
+    print_startup(&app).await?;
+
+    let command_app = app.clone();
+    tokio::spawn(async move {
+        command_loop(command_app).await;
+    });
+
+    let settings_app = app.clone();
+    tokio::spawn(async move {
+        settings_watcher(settings_app).await;
+    });
+
+    let balance_app = app.clone();
+    tokio::spawn(async move {
+        balance_watcher(balance_app).await;
+    });
+
+    scanner_loop(app).await
+}
+
+async fn scanner_loop(app: App) -> Result<(), Box<dyn Error + Send + Sync>> {
+    loop {
+        if app.config.shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        match scanner_session(app.clone()).await {
+            Ok(()) => {}
+            Err(err) => {
+                log_line(&app, &format!("{RED}[WS]{RESET} {err}")).await;
+            }
+        }
+
+        if !app.config.shutdown.load(Ordering::Relaxed) {
+            sleep(Duration::from_millis(250)).await;
         }
     }
 }
 
-// ----------------------------
-// TRADING SETTINGS
-// ----------------------------
-// Change values here — this is the main area to edit your bot settings.
-const GAS_PRIORITY_SOL: f64 = 0.0000001;
-const BRIBE_PRIORITY_SOL: f64 = 0.0000001;
-const SLIPPAGE_PCT: f64 = 25.0;
-const MEV_PROTECTION: bool = false;
-const PUMP_TOKENS_ONLY: bool = true;
-const AUTO_BUY_NEW_TOKENS: bool = true;
-const AUTO_SELL_PROFIT_PCT: f64 = 50.0;
-const AUTO_SELL_PERCENT: f64 = 100.0;
-const STARTING_SOL_BALANCE: f64 = 0.1;
-const TRADE_AMOUNT_SOL: f64 = 0.03;
+async fn scanner_session(app: App) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let url = format!("{}?api-key={}", PUMPPORTAL_WS, app.config.api_key);
 
-// ----------------------------
-// TOKEN LAYOUT SETTINGS
-// ----------------------------
-// Change values here — this is the main area to edit your token display.
-const TOKEN_BOX_WIDTH: usize = 93; // Full inner width; long links expand the box automatically.
-const MIGRATION_TITLE: &str = "🎯 MIGRATION";
-const PLATFORM_TITLE: &str = "🟢 PUMP.FUN";
-const MONITOR_LINE: &str = "────────────────────────────────────────────────────────────────────────────────";
+    let (ws, _) = connect_async(url).await?;
+    let (mut sink, mut stream) = ws.split();
 
-fn build_config() -> TradingConfig {
-    TradingConfig::defaults()
-}
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
-#[derive(Clone, Debug)]
-struct WalletInfo {
-    pubkey: String,
-    balance_sol: f64,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug, Default)]
-struct ExecutionStatus {
-    valid_private_key: bool,
-    rpc_ready: bool,
-    enough_sol: bool,
-    trade_ready: bool,
-    balance_sol: f64,
-    pubkey: String,
-}
-
-fn validate_private_key(private_key: &str) -> bool {
-    if private_key.trim().is_empty() {
-        return false;
+    {
+        let mut guard = app.ws_tx.lock().await;
+        *guard = Some(tx.clone());
     }
 
-    let decoded = match bs58::decode(private_key.trim()).into_vec() {
-        Ok(v) => v,
-        Err(_) => return false,
+    tx.send(Message::Text(
+        json!({"method":"subscribeNewToken"}).to_string().into(),
+    ))?;
+
+    // Needed for the migration counter / cards below — without this
+    // subscription "migrate" events never arrive on this connection.
+    tx.send(Message::Text(
+        json!({"method":"subscribeMigration"}).to_string().into(),
+    ))?;
+
+    tx.send(Message::Text(
+        json!({
+            "method":"subscribeAccountTrade",
+            "keys":[app.keypair.pubkey().to_string()]
+        })
+        .to_string()
+        .into(),
+    ))?;
+
+    let writer = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            if sink.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    log_line(&app, &format!("{GREEN}[WS] connected{RESET}")).await;
+
+    while !app.config.shutdown.load(Ordering::Relaxed) {
+        match stream.next().await {
+            Some(Ok(Message::Text(text))) => {
+                handle_ws_message(&app, &text).await;
+            }
+
+            Some(Ok(Message::Binary(bytes))) => {
+                if let Ok(text) = std::str::from_utf8(&bytes) {
+                    handle_ws_message(&app, text).await;
+                }
+            }
+
+            Some(Ok(Message::Ping(data))) => {
+                let sender = app.ws_tx.lock().await.clone();
+                if let Some(sender) = sender {
+                    let _ = sender.send(Message::Pong(data));
+                }
+            }
+
+            Some(Ok(Message::Close(_))) | None => break,
+
+            Some(Err(err)) => {
+                writer.abort();
+                let mut guard = app.ws_tx.lock().await;
+                *guard = None;
+                return Err(Box::new(err));
+            }
+
+            _ => {}
+        }
+    }
+
+    writer.abort();
+
+    let mut guard = app.ws_tx.lock().await;
+    *guard = None;
+
+    Ok(())
+}
+
+async fn handle_ws_message(app: &App, raw: &str) {
+    let value: Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(_) => return,
     };
 
-    if decoded.len() == 32 {
-        return solana_sdk::signature::Keypair::from_seed(&decoded).is_ok();
+    if value.get("txType").and_then(Value::as_str) == Some("migrate") {
+        if let Some(mint) = string_field(&value, "mint") {
+            app.migrated.lock().await.insert(mint.clone());
+            app.migration_count.fetch_add(1, Ordering::Relaxed);
+
+            let name = string_field(&value, "name").unwrap_or_else(|| "Migrated token".to_string());
+            let symbol = string_field(&value, "symbol").unwrap_or_else(|| "?".to_string());
+
+            log_line(app, &token_card("MIGRATION", GREEN, &name, &symbol, &mint)).await;
+        }
+        return;
     }
 
-    if decoded.len() == 64 {
-        let mut bytes = [0u8; 64];
-        bytes.copy_from_slice(&decoded);
-        return solana_sdk::signature::Keypair::from_bytes(&bytes).is_ok();
+    if let Some(token) = parse_new_token(&value) {
+        let app = app.clone();
+        tokio::spawn(async move {
+            buy_new_token(app, token).await;
+        });
+        return;
     }
 
-    false
+    if let Some(trade) = parse_trade_event(&value) {
+        let app = app.clone();
+        tokio::spawn(async move {
+            process_trade(app, trade).await;
+        });
+    }
 }
 
-fn derive_pubkey_from_private_key(private_key: &str) -> Option<String> {
-    let decoded = bs58::decode(private_key.trim()).into_vec().ok()?;
-
-    if decoded.len() == 32 {
-        let keypair = solana_sdk::signature::Keypair::from_seed(&decoded).ok()?;
-        return Some(keypair.pubkey().to_string());
+async fn buy_new_token(app: App, token: NewToken) {
+    if !app.config.auto_buy.load(Ordering::Relaxed) {
+        return;
     }
 
-    if decoded.len() == 64 {
-        let mut bytes = [0u8; 64];
-        bytes.copy_from_slice(&decoded);
-        let keypair = solana_sdk::signature::Keypair::from_bytes(&bytes).ok()?;
-        return Some(keypair.pubkey().to_string());
+    let hot = *app.hot.read().await;
+
+    if hot.pump_tokens_only && !token.mint.ends_with("pump") {
+        return;
     }
 
-    None
+    if !is_fresh(&token, hot.max_token_age_ms) {
+        return;
+    }
+
+    {
+        let mut seen = app.seen.lock().await;
+        if !seen.insert(token.mint.clone()) {
+            return;
+        }
+    }
+
+    // Re-check after the async dedupe lock in case auto-buy was flipped
+    // off in the meantime.
+    if !app.config.auto_buy.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let received_ms = token.received_at.elapsed().as_millis();
+
+    log_line(&app, &token_card("NEW TOKEN", YELLOW, &token.name, &token.symbol, &token.mint)).await;
+    log_line(
+        &app,
+        &format!(
+            "{DIM}[BUY]{RESET} {} · seen {received_ms}ms ago · buying {:.4} SOL...",
+            token.mint, hot.trade_amount_sol
+        ),
+    )
+    .await;
+
+    match execute_trade(&app, "buy", &token.mint, hot.trade_amount_sol, true).await {
+        Ok(signature) => {
+            app.bought_count.fetch_add(1, Ordering::Relaxed);
+            let tx_url = format!("https://solscan.io/tx/{signature}");
+
+            log_line(
+                &app,
+                &format!(
+                    "{GREEN}{BOLD}✓ SNIPED{RESET} {}\n  └ {CYAN}{UNDERLINE}{}{RESET}",
+                    token.mint,
+                    hyperlink(&tx_url, &tx_url)
+                ),
+            )
+            .await;
+
+            subscribe_token(&app, &token.mint).await;
+        }
+
+        Err(err) => {
+            log_line(
+                &app,
+                &format!("{RED}{BOLD}✗ BUY FAILED{RESET} {} — {err}", token.mint),
+            )
+            .await;
+        }
+    }
 }
 
-fn load_keypair_from_private_key(private_key: &str) -> Option<solana_sdk::signature::Keypair> {
-    let decoded = bs58::decode(private_key.trim()).into_vec().ok()?;
+async fn process_trade(app: App, trade: TradeEvent) {
+    let wallet = app.keypair.pubkey().to_string();
 
-    if decoded.len() == 32 {
-        return solana_sdk::signature::Keypair::from_seed(&decoded).ok();
+    if trade.trader == wallet
+        && trade.tx_type.eq_ignore_ascii_case("buy")
+        && trade.token_amount > 0.0
+        && trade.sol_amount > 0.0
+    {
+        let entry_price = trade.sol_amount / trade.token_amount;
+
+        {
+            let mut positions = app.positions.write().await;
+
+            positions.insert(
+                trade.mint.clone(),
+                Position {
+                    mint: trade.mint.clone(),
+                    entry_price_sol_per_token: entry_price,
+                    selling: false,
+                },
+            );
+        }
+
+        log_line(
+            &app,
+            &format!("{DIM}[TRACK]{RESET} {} entry {:.12} SOL/token", trade.mint, entry_price),
+        )
+        .await;
+
+        return;
     }
 
-    if decoded.len() == 64 {
-        let mut bytes = [0u8; 64];
-        bytes.copy_from_slice(&decoded);
-        return solana_sdk::signature::Keypair::from_bytes(&bytes).ok();
+    let position = {
+        let positions = app.positions.read().await;
+        positions.get(&trade.mint).cloned()
+    };
+
+    let Some(position) = position else {
+        return;
+    };
+
+    if position.selling
+        || trade.token_amount <= 0.0
+        || trade.sol_amount <= 0.0
+    {
+        return;
     }
 
-    None
+    let price = trade.sol_amount / trade.token_amount;
+    let pnl = ((price / position.entry_price_sol_per_token) - 1.0) * 100.0;
+
+    let hot = *app.hot.read().await;
+
+    if pnl < hot.auto_sell_profit_pct {
+        return;
+    }
+
+    {
+        let mut positions = app.positions.write().await;
+
+        let Some(pos) = positions.get_mut(&trade.mint) else {
+            return;
+        };
+
+        if pos.selling {
+            return;
+        }
+
+        pos.selling = true;
+    }
+
+    log_line(
+        &app,
+        &format!("{YELLOW}[SELL]{RESET} {} +{:.2}% · selling 100%...", position.mint, pnl),
+    )
+    .await;
+
+    match execute_trade(&app, "sell", &position.mint, 100.0, false).await {
+        Ok(signature) => {
+            let tx_url = format!("https://solscan.io/tx/{signature}");
+
+            log_line(
+                &app,
+                &format!(
+                    "{GREEN}{BOLD}✓ SOLD{RESET} {} +{:.2}%\n  └ {CYAN}{UNDERLINE}{}{RESET}",
+                    position.mint,
+                    pnl,
+                    hyperlink(&tx_url, &tx_url)
+                ),
+            )
+            .await;
+
+            app.positions.write().await.remove(&position.mint);
+            unsubscribe_token(&app, &position.mint).await;
+        }
+
+        Err(err) => {
+            log_line(
+                &app,
+                &format!("{RED}{BOLD}✗ SELL FAILED{RESET} {} — {err}", position.mint),
+            )
+            .await;
+
+            if let Some(pos) = app.positions.write().await.get_mut(&position.mint) {
+                pos.selling = false;
+            }
+        }
+    }
 }
 
-async fn get_balance_lamports(rpc_url: &str, pubkey: &str) -> Option<u64> {
-    let response = reqwest::Client::new()
-        .post(rpc_url)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getBalance",
-            "params": [pubkey]
-        }))
+async fn execute_trade(
+    app: &App,
+    action: &str,
+    mint: &str,
+    amount: f64,
+    denominated_in_sol: bool,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let hot = *app.hot.read().await;
+
+    let pool = if action == "sell" {
+        if app.migrated.lock().await.contains(mint) {
+            "pump-amm"
+        } else {
+            "pump"
+        }
+    } else {
+        "pump"
+    };
+
+    let body = json!({
+        "publicKey": app.keypair.pubkey().to_string(),
+        "action": action,
+        "mint": mint,
+        "amount": if action == "sell" {
+            json!("100%")
+        } else {
+            json!(amount)
+        },
+        "denominatedInSol": if action == "sell" {
+            "false"
+        } else if denominated_in_sol {
+            "true"
+        } else {
+            "false"
+        },
+        "slippage": hot.slippage_pct,
+        "priorityFee": hot.priority_fee_sol,
+        "pool": pool
+    });
+
+    let response = app
+        .http
+        .post(PUMPPORTAL_LOCAL_TX)
+        .header("content-type", "application/json")
+        .json(&body)
         .send()
-        .await
-        .ok()?;
+        .await?;
 
-    let payload: Value = response.json().await.ok()?;
-    payload
-        .get("result")
-        .and_then(|value| value.get("value"))
-        .and_then(|value| value.as_u64())
-}
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
 
-async fn get_recent_blockhash(rpc_url: &str) -> Option<Hash> {
-    let response = reqwest::Client::new()
-        .post(rpc_url)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getLatestBlockhash",
-            "params": [{ "commitment": "confirmed" }]
-        }))
-        .send()
-        .await
-        .ok()?;
-
-    let payload: Value = response.json().await.ok()?;
-    let blockhash = payload
-        .get("result")
-        .and_then(|value| value.get("value"))
-        .and_then(|value| value.get("blockhash"))
-        .and_then(|v| v.as_str())?;
-
-    Hash::from_str(blockhash).ok()
-}
-
-async fn send_real_mainnet_tx_smoke_test() -> Result<String, Box<dyn Error>> {
-    let enable_real_tx = std::env::var("ENABLE_REAL_TX")
-        .unwrap_or_default()
-        .eq_ignore_ascii_case("true");
-
-    if !enable_real_tx {
-        return Err("ENABLE_REAL_TX is not true; mainnet transaction execution is disabled".into());
+        return Err(
+            format!("PumpPortal HTTP {}: {}", status, text).into()
+        );
     }
 
-    let private_key = std::env::var("PRIVATE_KEY")?;
-    let keypair = load_keypair_from_private_key(&private_key)
-        .ok_or("PRIVATE_KEY is not a valid base58 Solana key")?;
+    let bytes = response.bytes().await?;
 
-    let wallet_pubkey = keypair.pubkey().to_string();
-    let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
-    let balance_lamports = get_balance_lamports(&rpc_url, &wallet_pubkey).await
-        .ok_or("Could not load wallet balance from RPC")?;
-
-    if balance_lamports < 1_000 {
-        return Err(format!("Wallet balance is too low to sign a mainnet tx: {} lamports", balance_lamports).into());
+    if bytes.is_empty() {
+        return Err("PumpPortal returned an empty transaction".into());
     }
 
-    let recent_blockhash = get_recent_blockhash(&rpc_url).await
-        .ok_or("Could not fetch recent blockhash")?;
+    let unsigned: VersionedTransaction =
+        bincode::deserialize(&bytes)?;
 
-    let recipient = Pubkey::from_str(&wallet_pubkey).unwrap();
-    let instruction = system_instruction::transfer(&keypair.pubkey(), &recipient, 1);
-    let message = SolanaMessage::new(&[instruction], Some(&keypair.pubkey()));
-    let mut transaction = Transaction::new_unsigned(message);
-    transaction.sign(&[&keypair], recent_blockhash);
+    let signed = VersionedTransaction::try_new(
+        unsigned.message,
+        &[app.keypair.as_ref()],
+    )?;
 
-    let serialized = bincode::serialize(&transaction)?;
-    let tx_base64 = base64::engine::general_purpose::STANDARD.encode(serialized);
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(bincode::serialize(&signed)?);
 
-    let response = reqwest::Client::new()
-        .post(&rpc_url)
+    if hot.mev_protection {
+        send_jito(app, &signed).await
+    } else {
+        send_rpc(app, encoded).await
+    }
+}
+
+async fn send_rpc(
+    app: &App,
+    encoded: String,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let payload: Value = app
+        .http
+        .post(&app.config.rpc_url)
         .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendTransaction",
-            "params": [
-                tx_base64,
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"sendTransaction",
+            "params":[
+                encoded,
                 {
-                    "skipPreflight": false,
-                    "preflightCommitment": "confirmed",
-                    "encoding": "base64"
+                    "encoding":"base64",
+                    "skipPreflight":true,
+                    "maxRetries":0,
+                    "preflightCommitment":"processed"
                 }
             ]
         }))
         .send()
+        .await?
+        .json()
         .await?;
 
-    let payload: Value = response.json().await?;
-    let signature = payload
-        .get("result")
-        .and_then(|v| v.as_str())
-        .ok_or("sendTransaction did not return a signature")?;
-
-    println!("{}REAL MAINNET TX SENT:{} {}{}", CYAN, RESET, GREEN, signature);
-
-    let confirmation_url = format!("https://explorer.solana.com/tx/{signature}");
-    println!("{}CONFIRMATION:{} {}{}", CYAN, RESET, BLUE, confirmation_url);
-
-    Ok(signature.to_string())
-}
-
-async fn load_wallet_info() -> Option<WalletInfo> {
-    let private_key = std::env::var("PRIVATE_KEY").ok()?;
-    if private_key.trim().is_empty() {
-        return None;
+    if let Some(error) = payload.get("error") {
+        return Err(format!("RPC sendTransaction error: {}", error).into());
     }
 
-    let pubkey = derive_pubkey_from_private_key(&private_key)?;
-    let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
-
-    let response = reqwest::Client::new()
-        .post(rpc_url)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getBalance",
-            "params": [pubkey]
-        }))
-        .send()
-        .await
-        .ok()?;
-
-    let payload: Value = response.json().await.ok()?;
-    let lamports = payload
+    payload
         .get("result")
-        .and_then(|value| value.get("value"))
-        .and_then(|value| value.as_u64())?;
-
-    let balance_sol = lamports as f64 / 1_000_000_000.0;
-
-    Some(WalletInfo {
-        pubkey,
-        balance_sol,
-    })
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("RPC returned no signature: {}", payload).into())
 }
 
-async fn check_execution_ready() -> ExecutionStatus {
-    let private_key = std::env::var("PRIVATE_KEY").unwrap_or_default();
-    let valid_private_key = validate_private_key(&private_key);
+async fn send_jito(
+    app: &App,
+    signed: &VersionedTransaction,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let tx = bs58::encode(bincode::serialize(signed)?).into_string();
 
-    if !valid_private_key {
-        return ExecutionStatus {
-            valid_private_key: false,
-            rpc_ready: false,
-            enough_sol: false,
-            trade_ready: false,
-            balance_sol: 0.0,
-            pubkey: String::new(),
-        };
-    }
-
-    let pubkey = derive_pubkey_from_private_key(&private_key).unwrap_or_default();
-    let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
-
-    let response = reqwest::Client::new()
-        .post(&rpc_url)
+    let payload: Value = app
+        .http
+        .post(JITO_BUNDLE_URL)
         .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getBalance",
-            "params": [pubkey.clone()]
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"sendBundle",
+            "params":[[tx]]
         }))
         .send()
-        .await;
+        .await?
+        .json()
+        .await?;
 
-    let balance_sol = match response {
-        Ok(resp) => {
-            match resp.json::<Value>().await {
-                Ok(payload) => payload
-                    .get("result")
-                    .and_then(|value| value.get("value"))
-                    .and_then(|value| value.as_u64())
-                    .map(|lamports| lamports as f64 / 1_000_000_000.0)
-                    .unwrap_or(0.0),
-                Err(_) => 0.0,
+    if let Some(error) = payload.get("error") {
+        return Err(format!("Jito error: {}", error).into());
+    }
+
+    signed
+        .signatures
+        .first()
+        .map(ToString::to_string)
+        .ok_or_else(|| "Signed transaction has no signature".into())
+}
+
+async fn subscribe_token(app: &App, mint: &str) {
+    let sender = app.ws_tx.lock().await.clone();
+
+    if let Some(sender) = sender {
+        let _ = sender.send(Message::Text(
+            json!({
+                "method":"subscribeTokenTrade",
+                "keys":[mint]
+            })
+            .to_string()
+            .into(),
+        ));
+    }
+}
+
+async fn unsubscribe_token(app: &App, mint: &str) {
+    let sender = app.ws_tx.lock().await.clone();
+
+    if let Some(sender) = sender {
+        let _ = sender.send(Message::Text(
+            json!({
+                "method":"unsubscribeTokenTrade",
+                "keys":[mint]
+            })
+            .to_string()
+            .into(),
+        ));
+    }
+}
+
+async fn command_loop(app: App) {
+    log_line(&app, "[CTRL] on | off | status | quit").await;
+
+    let stdin = BufReader::new(io::stdin());
+    let mut lines = stdin.lines();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        match line.trim().to_ascii_lowercase().as_str() {
+            "on" | "buy on" => {
+                app.config.auto_buy.store(true, Ordering::Relaxed);
+                log_line(&app, "[CTRL] AUTO BUY ON").await;
             }
-        }
-        Err(_) => 0.0,
-    };
 
-    let rpc_ready = !pubkey.is_empty() && balance_sol >= 0.0;
-    let need_for_trade = 0.02;
-    let enough_sol = balance_sol >= need_for_trade;
-    let trade_ready = valid_private_key && rpc_ready && enough_sol;
+            "off" | "buy off" | "stop" => {
+                app.config.auto_buy.store(false, Ordering::Relaxed);
+                log_line(&app, "[CTRL] AUTO BUY OFF").await;
+            }
 
-    ExecutionStatus {
-        valid_private_key,
-        rpc_ready,
-        enough_sol,
-        trade_ready,
-        balance_sol,
-        pubkey,
-    }
-}
+            "status" => {
+                let positions = app.positions.read().await;
+                let hot = *app.hot.read().await;
 
-#[tokio::main]
-async fn main() {
-    dotenv::dotenv().ok();
+                log_line(
+                    &app,
+                    &format!(
+                        "[STATUS] auto_buy={} positions={} bought={} migrations={} trade_amount={:.4} SOL slippage={:.1}%",
+                        on_off(app.config.auto_buy.load(Ordering::Relaxed)),
+                        positions.len(),
+                        app.bought_count.load(Ordering::Relaxed),
+                        app.migration_count.load(Ordering::Relaxed),
+                        hot.trade_amount_sol,
+                        hot.slippage_pct,
+                    ),
+                )
+                .await;
+            }
 
-    let private_key = std::env::var("PRIVATE_KEY").unwrap_or_else(|_| String::new());
-    if private_key.is_empty() {
-        eprintln!("{}PRIVATE_KEY is missing. Add it to .env as PRIVATE_KEY=YOUR_KEY{}", RED, RESET);
-    } else {
-        println!("{}PRIVATE_KEY loaded from .env{}", GREEN, RESET);
-    }
-
-    let wallet = load_wallet_info().await;
-    let config = build_config();
-    let execution_status = check_execution_ready().await;
-    let bot_status = build_bot_status(config, wallet.as_ref().map(|w| w.balance_sol).unwrap_or(execution_status.balance_sol));
-    print_bot_status(&bot_status);
-    if let Some(wallet) = wallet {
-        println!("{}WALLET:{} {}{}", CYAN, RESET, wallet.pubkey, RESET);
-    }
-
-    if real_trade_enabled() {
-        println!("{}LIVE MODE ENABLED: real mainnet execution is ON{}", GREEN, RESET);
-    } else {
-        println!("{}DRY RUN MODE: real mainnet execution is OFF{}", YELLOW, RESET);
-    }
-
-    if real_trade_enabled() {
-        match send_real_mainnet_tx_smoke_test().await {
-            Ok(_) => println!("{}MAINNET TX TEST COMPLETED{}", GREEN, RESET),
-            Err(err) => eprintln!("{}MAINNET TX TEST FAILED:{} {}{}", RED, RESET, YELLOW, err),
-        }
-    }
-
-    println!("{}EXECUTION GATES{}", CYAN, RESET);
-    println!("KEY VALID: {}{}{}", if execution_status.valid_private_key { GREEN } else { RED }, if execution_status.valid_private_key { "YES" } else { "NO" }, RESET);
-    println!("RPC READY: {}{}{}", if execution_status.rpc_ready { GREEN } else { RED }, if execution_status.rpc_ready { "YES" } else { "NO" }, RESET);
-    println!("ENOUGH SOL: {}{}{}", if execution_status.enough_sol { GREEN } else { RED }, if execution_status.enough_sol { "YES" } else { "NO" }, RESET);
-    println!("AUTO-TRADE READY: {}{}{}\n", if execution_status.trade_ready { GREEN } else { RED }, if execution_status.trade_ready { "YES" } else { "NO" }, RESET);
-
-    if !execution_status.trade_ready {
-        println!("{}REAL EXECUTION BLOCKED: missing private key / RPC / solvency checks.{}", YELLOW, RESET);
-    }
-
-    loop {
-        match connect_and_listen(config).await {
-            Ok(true) => {
-                println!("{}Scanner shutdown requested. Exiting cleanly.{}", YELLOW, RESET);
+            "quit" | "exit" => {
+                app.config.auto_buy.store(false, Ordering::Relaxed);
+                app.config.shutdown.store(true, Ordering::Relaxed);
+                log_line(&app, "[CTRL] shutdown").await;
                 break;
             }
-            Ok(false) => {
-                println!("{}WebSocket session ended. Reconnecting in {}s...{}", YELLOW, RECONNECT_DELAY.as_secs(), RESET);
-            }
-            Err(err) => {
-                eprintln!("{}WebSocket error: {}. Reconnecting in {}s...{}", YELLOW, err, RECONNECT_DELAY.as_secs(), RESET);
-            }
-        }
 
-        sleep(RECONNECT_DELAY).await;
-    }
-}
-
-async fn connect_and_listen(config: TradingConfig) -> Result<bool, Box<dyn Error>> {
-    print_trade_config(config);
-    println!("{}{}{}", RED, PUMP_ASCII, RESET);
-    println!("\n{}PUMP.FUN TOKEN SCANNER{}", YELLOW, RESET);
-    println!("{}Real-time new token detection via PumpPortal{}\n", CYAN, RESET);
-
-    println!("[{}] {}Connecting to PumpPortal WebSocket...{}", timestamp(), YELLOW, RESET);
-    let (mut ws_stream, _) = connect_async(WS_URL).await?;
-
-    println!("[{}] {}Connected{}", timestamp(), GREEN, RESET);
-    println!("[{}] {}Subscribing to new token events...{}", timestamp(), YELLOW, RESET);
-
-    ws_stream
-        .send(Message::Text(r#"{"method":"subscribeNewToken"}"#.into()))
-        .await?;
-
-    println!("[{}] {}Subscribed — waiting for new tokens...{}", timestamp(), GREEN, RESET);
-
-    let mut shutdown = Box::pin(tokio::signal::ctrl_c());
-
-    loop {
-        tokio::select! {
-            _ = shutdown.as_mut() => {
-                println!("{}\nInterrupted by user. Closing websocket...{}", YELLOW, RESET);
-                ws_stream.close(None).await.ok();
-                return Ok(true);
-            }
-            msg = ws_stream.next() => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Some(token) = parse_token_message(&text) {
-                            print_token(token).await;
-                        } else if text.contains("Successfully subscribed") {
-                            println!("[{}] {}Subscribed — waiting for new tokens...{}", timestamp(), GREEN, RESET);
-                        } else if text.contains("Invalid") || text.contains("error") || text.contains("Error") {
-                            eprintln!("[{}] {}{}{}", timestamp(), YELLOW, text, RESET);
-                        }
-                    }
-                    Some(Ok(Message::Binary(bytes))) => {
-                        let text = String::from_utf8_lossy(&bytes);
-                        if let Some(token) = parse_token_message(&text) {
-                            print_token(token).await;
-                        }
-                    }
-                    Some(Ok(Message::Ping(_))) => {
-                        ws_stream.send(Message::Pong(vec![])).await?;
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        return Ok(false);
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(err)) => return Err(Box::new(err)),
-                }
+            _ => {
+                log_line(&app, "[CTRL] on | off | status | quit").await;
             }
         }
     }
 }
 
-fn print_trade_config(config: TradingConfig) {
-    println!("{}{}Wallet{} {}{:.4} SOL{}{}", CYAN, WHITE, RESET, GREEN, config.starting_sol_balance, RESET, RESET);
-    println!("{}LIVE{} | {}Migrations 0{} | {}Bought 0{} | {}Listening{}", GREEN, RESET, YELLOW, RESET, YELLOW, RESET, CYAN, RESET);
-    println!("{}Waiting for tokens to graduate...{}\n", YELLOW, RESET);
-    println!("[{}PumpFun{}] {}Connecting...{}", YELLOW, RESET, CYAN, RESET);
-    println!("[{}PumpFun{}] {}Connected{}", YELLOW, RESET, GREEN, RESET);
-    println!("[{}PumpFun{}] {}Subscribed to migrations{}\n", YELLOW, RESET, CYAN, RESET);
-    println!("{}{}----- TRADING SETTINGS -----{}", CYAN, RESET, RESET);
-    println!("{}Gas priority:{} {:.5} SOL", YELLOW, RESET, config.gas_priority_sol);
-    println!("{}Bribe priority:{} {:.5} SOL", YELLOW, RESET, config.bribe_priority_sol);
-    println!("{}Slippage:{} {:.1}%", YELLOW, RESET, config.slippage_pct);
-    println!("{}MEV protection:{} {}", YELLOW, RESET, if config.mev_protection { "ON" } else { "OFF" });
-    println!("{}Pump tokens only:{} {}", YELLOW, RESET, if config.pump_tokens_only { "YES" } else { "NO" });
-    println!("{}Auto buy new tokens:{} {}", YELLOW, RESET, if config.auto_buy_new_tokens { "YES" } else { "NO" });
-    println!("{}Auto sell profit:{} {:.0}%", YELLOW, RESET, config.auto_sell_profit_pct);
-    println!("{}Auto sell amount:{} {:.0}%", YELLOW, RESET, config.auto_sell_percent);
-    println!("{}Starting balance:{} {:.2} SOL{}\n", YELLOW, RESET, config.starting_sol_balance, RESET);
-}
-
-fn parse_token_message(raw: &str) -> Option<Token> {
-    let value: Value = serde_json::from_str(raw).ok()?;
-
-    value.get("mint")?;
-
-    if value.get("txType").and_then(|v| v.as_str()) != Some("create") {
+fn parse_new_token(v: &Value) -> Option<NewToken> {
+    if v.get("txType").and_then(Value::as_str) != Some("create") {
         return None;
     }
 
-    let mint = get_string(&value, &["mint"]).unwrap_or_else(|| "N/A".to_string());
-    let name = get_string(&value, &["name"]).unwrap_or_else(|| "N/A".to_string());
-    let symbol = get_string(&value, &["symbol"]).unwrap_or_else(|| "N/A".to_string());
-    let creator = get_string(&value, &["traderPublicKey", "creator", "creatorAddress", "creator_address"]).unwrap_or_else(|| "N/A".to_string());
-    let bonding_curve = get_string(&value, &["bondingCurveKey", "bonding_curve"]).unwrap_or_else(|| "N/A".to_string());
-    let market_cap = get_f64(&value, &["marketCapSol", "market_cap", "marketCap"]).map(format_market_cap).unwrap_or_else(|| "N/A".to_string());
-    let initial_buy = get_f64(&value, &["initialBuy"]).map(format_initial_buy).unwrap_or_else(|| "N/A".to_string());
-    let bonding_sol = get_f64(&value, &["solAmount"]).map(|v| format!("{:.4} SOL", v)).unwrap_or_else(|| "N/A".to_string());
-    let metadata = get_string(&value, &["uri", "metadata"]).unwrap_or_else(|| "N/A".to_string());
-    let pump_url = format!("https://pump.fun/coin/{}", mint);
-    let solscan_url = format!("https://solscan.io/token/{}", mint);
-    let chart_url = format!("https://dexscreener.com/solana/{}", mint);
+    let mint = string_field(v, "mint")?;
+    let name = string_field(v, "name").unwrap_or_else(|| "Unknown".to_string());
+    let symbol = string_field(v, "symbol").unwrap_or_else(|| "?".to_string());
 
-    Some(Token {
+    let source_timestamp_ms = v
+        .get("timestamp")
+        .or_else(|| v.get("createdTimestamp"))
+        .or_else(|| v.get("created_timestamp"))
+        .and_then(|value| value.as_u64())
+        .map(|ts| {
+            if ts < 1_000_000_000_000 {
+                ts.saturating_mul(1_000)
+            } else {
+                ts
+            }
+        });
+
+    Some(NewToken {
         mint,
         name,
         symbol,
-        creator,
-        bonding_curve,
-        market_cap,
-        initial_buy,
-        bonding_sol,
-        metadata,
-        pump_url,
-        chart_url,
-        solscan_url,
+        received_at: Instant::now(),
+        source_timestamp_ms,
     })
 }
 
-struct Token {
-    mint: String,
-    name: String,
-    symbol: String,
-    creator: String,
-    bonding_curve: String,
-    market_cap: String,
-    initial_buy: String,
-    bonding_sol: String,
-    metadata: String,
-    pump_url: String,
-    chart_url: String,
-    solscan_url: String,
+fn parse_trade_event(v: &Value) -> Option<TradeEvent> {
+    Some(TradeEvent {
+        mint: string_field(v, "mint")?,
+        tx_type: string_field(v, "txType").unwrap_or_default(),
+        trader: string_field(v, "traderPublicKey")
+            .or_else(|| string_field(v, "trader"))
+            .unwrap_or_default(),
+        sol_amount: number_field(v, "solAmount")?,
+        token_amount: number_field(v, "tokenAmount")?,
+    })
 }
 
-impl Token {
-    #[allow(dead_code)]
-    fn _unused_debug_fields(&self) {
-        let _ = (&self.creator, &self.bonding_curve, &self.initial_buy, &self.bonding_sol, &self.metadata, &self.chart_url, &self.solscan_url);
+fn string_field(v: &Value, key: &str) -> Option<String> {
+    v.get(key)?.as_str().map(str::to_owned)
+}
+
+fn number_field(v: &Value, key: &str) -> Option<f64> {
+    let value = v.get(key)?;
+
+    value
+        .as_f64()
+        .or_else(|| value.as_u64().map(|n| n as f64))
+        .or_else(|| value.as_i64().map(|n| n as f64))
+        .or_else(|| value.as_str()?.parse::<f64>().ok())
+}
+
+fn is_fresh(token: &NewToken, max_age_ms: u64) -> bool {
+    if let Some(timestamp) = token.source_timestamp_ms {
+        let now = unix_ms();
+
+        if now >= timestamp {
+            return now - timestamp <= max_age_ms;
+        }
+    }
+
+    // If PumpPortal does not provide a usable timestamp,
+    // the event is treated as fresh when it reaches this process.
+    token.received_at.elapsed().as_millis() as u64 <= max_age_ms
+}
+
+fn load_keypair(
+    private_key: &str,
+) -> Result<Keypair, Box<dyn Error + Send + Sync>> {
+    let bytes = bs58::decode(private_key.trim())
+        .into_vec()
+        .map_err(|e| format!("Invalid base58 PRIVATE_KEY: {e}"))?;
+
+    match bytes.len() {
+        32 => Keypair::from_seed(&bytes)
+            .map_err(|e| format!("Invalid 32-byte private key seed: {e}").into()),
+
+        64 => Keypair::from_bytes(&bytes)
+            .map_err(|e| format!("Invalid 64-byte private key: {e}").into()),
+
+        n => Err(
+            format!(
+                "PRIVATE_KEY decoded to {} bytes, expected 32 or 64",
+                n
+            )
+            .into(),
+        ),
     }
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-struct Position {
-    mint: String,
-    name: String,
-    symbol: String,
-    chart_url: String,
-    snip_url: String,
-    entry_sol: f64,
-    last_pct: f64,
-    last_sol: f64,
-}
-
-struct BotStatus {
-    active: bool,
-    balance_sol: f64,
-    buy_amount_sol: f64,
-    slippage_pct: f64,
-    priority_fee_sol: f64,
-    mode: String,
-}
-
-#[allow(dead_code)]
-fn wallet_connected() -> bool {
-    !std::env::var("PRIVATE_KEY").unwrap_or_default().trim().is_empty()
-}
-
-fn build_bot_status(config: TradingConfig, balance_sol: f64) -> BotStatus {
-    BotStatus {
-        active: true,
-        balance_sol,
-        buy_amount_sol: 0.1,
-        slippage_pct: config.slippage_pct,
-        priority_fee_sol: config.gas_priority_sol,
-        mode: "PUMPFUN".to_string(),
-    }
-}
-
-fn real_trade_ready_for_auto_buy(balance_sol: f64, buy_amount_sol: f64, priority_fee_sol: f64) -> bool {
-    let required = buy_amount_sol + priority_fee_sol + 0.001;
-    balance_sol >= required
-}
-
-fn real_trade_enabled() -> bool {
-    std::env::var("ENABLE_REAL_TX")
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .eq_ignore_ascii_case("true")
+        .as_millis() as u64
 }
 
-async fn get_jupiter_quote(
-    input_mint: &str,
-    output_mint: &str,
-    amount: u64,
-    slippage_bps: u16,
-) -> Result<Value, Box<dyn Error>> {
-    let url = format!(
-        "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}&onlyDirectRoutes=true&asLegacyTransaction=false",
-        input_mint, output_mint, amount, slippage_bps
-    );
-
-    let response = reqwest::Client::new().get(&url).send().await?;
-    let payload: Value = response.json().await?;
-
-    if payload.get("error").is_some() {
-        let message = payload.get("error").and_then(|v| v.as_str()).unwrap_or("unknown Jupiter error");
-        return Err(format!("Jupiter quote error: {}", message).into());
-    }
-
-    Ok(payload)
+fn env_bool(name: &str, default: bool) -> bool {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(default)
 }
 
-async fn sign_and_send_jupiter_swap(
-    keypair: &solana_sdk::signature::Keypair,
-    rpc_url: &str,
-    swap_transaction_b64: &str,
-) -> Result<String, Box<dyn Error>> {
-    let tx_bytes = base64::engine::general_purpose::STANDARD.decode(swap_transaction_b64)?;
-    let tx: VersionedTransaction = bincode::deserialize(&tx_bytes)?;
-    let signed_tx = VersionedTransaction::try_new(tx.message.clone(), &[keypair])?;
-    let tx_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&signed_tx)?);
-
-    let response = reqwest::Client::new()
-        .post(rpc_url)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendTransaction",
-            "params": [
-                tx_b64,
-                {
-                    "skipPreflight": false,
-                    "preflightCommitment": "confirmed",
-                    "encoding": "base64"
-                }
-            ]
-        }))
-        .send()
-        .await?;
-
-    let payload: Value = response.json().await?;
-    let signature = payload
-        .get("result")
-        .and_then(|v| v.as_str())
-        .ok_or("Jupiter swap did not return a transaction signature")?;
-
-    Ok(signature.to_string())
+fn env_f64(name: &str, default: f64) -> f64 {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(default)
 }
 
-async fn execute_real_buy_token(token: &Token) -> Result<String, Box<dyn Error>> {
-    let private_key = std::env::var("PRIVATE_KEY")?;
-    let keypair = load_keypair_from_private_key(&private_key)
-        .ok_or("PRIVATE_KEY is not a valid base58 Solana key")?;
-    let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
-
-    let buy_amount_lamports = (TRADE_AMOUNT_SOL * 1_000_000_000.0) as u64;
-    let quote = get_jupiter_quote(
-        "So11111111111111111111111111111111111111112",
-        &token.mint,
-        buy_amount_lamports,
-        (SLIPPAGE_PCT * 100.0) as u16,
-    ).await?;
-
-    let response = reqwest::Client::new()
-        .post("https://quote-api.jup.ag/v6/swap")
-        .json(&json!({
-            "quoteResponse": quote,
-            "userPublicKey": keypair.pubkey().to_string(),
-            "wrapAndUnwrapSol": true,
-            "dynamicComputeUnitLimit": true,
-            "prioritizationFeeLamports": "auto"
-        }))
-        .send()
-        .await?;
-
-    let payload: Value = response.json().await?;
-    let tx_b64 = payload
-        .get("swapTransaction")
-        .and_then(|v| v.as_str())
-        .ok_or("Jupiter swap endpoint did not return a swapTransaction")?;
-
-    let signature = sign_and_send_jupiter_swap(&keypair, &rpc_url, tx_b64).await?;
-    println!("{}REAL BUY SENT:{} {}{}", CYAN, RESET, GREEN, signature);
-    Ok(signature)
+fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
-async fn get_token_account_amount(owner: &str, mint: &str, rpc_url: &str) -> Result<u64, Box<dyn Error>> {
-    let response = reqwest::Client::new()
-        .post(rpc_url)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTokenAccountsByOwner",
-            "params": [
-                owner,
-                {
-                    "mint": mint
-                },
-                {
-                    "encoding": "jsonParsed",
-                    "commitment": "confirmed"
-                }
-            ]
-        }))
-        .send()
-        .await?;
+// ---- live .env reload ----
 
-    let payload: Value = response.json().await?;
-    let amount = payload
-        .get("result")
-        .and_then(|v| v.get("value"))
-        .and_then(|v| v.as_array())
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("account"))
-        .and_then(|acc| acc.get("data"))
-        .and_then(|data| data.get("parsed"))
-        .and_then(|parsed| parsed.get("info"))
-        .and_then(|info| info.get("tokenAmount"))
-        .and_then(|token_amount| token_amount.get("amount"))
-        .and_then(|amount| amount.as_str())
-        .ok_or("Could not resolve token account amount for sell")?;
+/// Reads a dotenv-style file straight off disk into a map, without touching
+/// process env vars. Used for polling so we can detect changes at runtime.
+fn read_env_file(path: &Path) -> HashMap<String, String> {
+    let mut map = HashMap::new();
 
-    Ok(amount.parse::<u64>()?)
-}
-
-async fn execute_real_sell_token(token_mint: &str) -> Result<String, Box<dyn Error>> {
-    let private_key = std::env::var("PRIVATE_KEY")?;
-    let keypair = load_keypair_from_private_key(&private_key)
-        .ok_or("PRIVATE_KEY is not a valid base58 Solana key")?;
-    let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
-    let owner = keypair.pubkey().to_string();
-    let token_amount = get_token_account_amount(&owner, token_mint, &rpc_url).await?;
-    if token_amount == 0 {
-        return Err(format!("No token balance found for sell of {}", token_mint).into());
-    }
-
-    let quote = get_jupiter_quote(token_mint, "So11111111111111111111111111111111111111112", token_amount, (SLIPPAGE_PCT * 100.0) as u16).await?;
-    let response = reqwest::Client::new()
-        .post("https://quote-api.jup.ag/v6/swap")
-        .json(&json!({
-            "quoteResponse": quote,
-            "userPublicKey": keypair.pubkey().to_string(),
-            "wrapAndUnwrapSol": true,
-            "dynamicComputeUnitLimit": true,
-            "prioritizationFeeLamports": "auto"
-        }))
-        .send()
-        .await?;
-
-    let payload: Value = response.json().await?;
-    let tx_b64 = payload
-        .get("swapTransaction")
-        .and_then(|v| v.as_str())
-        .ok_or("Jupiter sell endpoint did not return a swapTransaction")?;
-
-    let signature = sign_and_send_jupiter_swap(&keypair, &rpc_url, tx_b64).await?;
-    println!("{}REAL SELL SENT:{} {}{}", CYAN, RESET, GREEN, signature);
-    Ok(signature)
-}
-
-async fn run_real_trade_cycle(token: &Token) {
-    if let Err(err) = execute_real_buy_token(token).await {
-        eprintln!("{}REAL BUY FAILED:{} {}{}", RED, RESET, YELLOW, err);
-        return;
-    }
-
-    let mut attempts = 0usize;
-    loop {
-        if attempts >= 120 {
-            break;
-        }
-
-        sleep(Duration::from_secs(5)).await;
-        attempts += 1;
-
-        let keypair = match load_keypair_from_private_key(&std::env::var("PRIVATE_KEY").unwrap_or_default()) {
-            Some(k) => k,
-            None => break,
-        };
-
-        let owner = keypair.pubkey().to_string();
-        let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
-        let token_amount = match get_token_account_amount(&owner, &token.mint, &rpc_url).await {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-        if token_amount == 0 {
-            break;
-        }
-
-        let quote = match get_jupiter_quote(&token.mint, "So11111111111111111111111111111111111111112", token_amount, 250).await {
-            Ok(q) => q,
-            Err(_) => continue,
-        };
-
-        let out_amount = quote.get("outAmount").and_then(|v| v.as_str()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-        let entry_lamports = (TRADE_AMOUNT_SOL * 1_000_000_000.0) as u64;
-        if out_amount > 0 && entry_lamports > 0 {
-            let pnl_pct = ((out_amount as f64 / entry_lamports as f64) - 1.0) * 100.0;
-            if pnl_pct >= 50.0 {
-                if let Err(err) = execute_real_sell_token(&token.mint).await {
-                    eprintln!("{}REAL SELL FAILED:{} {}{}", RED, RESET, YELLOW, err);
-                }
-                break;
-            }
-        }
-    }
-}
-
-fn print_bot_status(status: &BotStatus) {
-    let light = if status.active { GREEN } else { RED };
-    let label = if status.active { "ON" } else { "OFF" };
-
-    println!("{}===== BOT STATUS ====={}", CYAN, RESET);
-    println!("{}LIGHT:{} {}{}", YELLOW, RESET, light, label);
-    println!("{}MODE:{} {}{}", YELLOW, RESET, WHITE, status.mode);
-    println!("{}BUY AMOUNT:{} {:.4} SOL{}", YELLOW, RESET, status.buy_amount_sol, RESET);
-    println!("{}SLIPPAGE:{} {:.1}%{}", YELLOW, RESET, status.slippage_pct, RESET);
-    println!("{}PRIORITY FEE:{} {:.5} SOL{}", YELLOW, RESET, status.priority_fee_sol, RESET);
-    println!("{}WALLET:{} {:.4} SOL{}\n", YELLOW, RESET, status.balance_sol, RESET);
-}
-
-async fn print_token(token: Token) {
-    if !should_trade_pump_token(&token) {
-        return;
-    }
-
-    if !record_trade_entry_if_needed(&token) {
-        return;
-    }
-
-    if !real_trade_enabled() {
-        print_migration_card(&token);
-        println!("{}{}⏳ DRY RUN: waiting for pool to settle...{}", BOLD, YELLOW, RESET);
-        println!("{}{}⚡ DRY RUN → simulated buy of {}{:.1} SOL{}...{}", BOLD, YELLOW, GREEN, TRADE_AMOUNT_SOL, YELLOW, RESET);
-        println!("{}{}✓ DRY RUN ONLY — no real transaction sent{}", BOLD, GREEN, RESET);
-        println!("  {}↳{} {}{}{}", WHITE, RESET, BLUE, token.solscan_url, RESET);
-        println!();
-        println!("{}{}💎 MONITORING{}", BOLD, CYAN, RESET);
-        println!("{}{}{}", WHITE, MONITOR_LINE, RESET);
-        println!(
-            "[{}] {}{}{} | SOL {}+0.0000{} | MCap {}{}{} | {}+0.00%{}",
-            timestamp(), WHITE, clean_terminal_text(&token.name), RESET,
-            GREEN, RESET,
-            WHITE, token.market_cap, RESET,
-            GREEN, RESET,
-        );
-        return;
-    }
-
-    let wallet_balance = match load_wallet_info().await {
-        Some(info) => info.balance_sol,
-        None => 0.0,
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return map;
     };
 
-    if !real_trade_ready_for_auto_buy(wallet_balance, TRADE_AMOUNT_SOL, GAS_PRIORITY_SOL) {
-        print_migration_card(&token);
-        println!("{}{}⏳ LIVE MODE: insufficient wallet balance for real trade...{}", BOLD, YELLOW, RESET);
-        println!("{}{}⚠️ LIVE BUY BLOCKED: needs {:.4} SOL, wallet has {:.4} SOL{}", BOLD, RED, TRADE_AMOUNT_SOL + GAS_PRIORITY_SOL + 0.001, wallet_balance, RESET);
-        println!("  {}↳{} {}{}{}", WHITE, RESET, BLUE, token.solscan_url, RESET);
+    for line in contents.lines() {
+        let line = line.trim();
+
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+
+        let key = key.trim().to_string();
+        let mut value = value.trim().to_string();
+
+        if value.len() >= 2 {
+            let bytes = value.as_bytes();
+            let quoted = (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+                || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'');
+
+            if quoted {
+                value = value[1..value.len() - 1].to_string();
+            }
+        }
+
+        map.insert(key, value);
+    }
+
+    map
+}
+
+fn map_bool(map: &HashMap<String, String>, key: &str, default: bool) -> bool {
+    map.get(key).and_then(|v| v.parse::<bool>().ok()).unwrap_or(default)
+}
+
+fn map_f64(map: &HashMap<String, String>, key: &str, default: f64) -> f64 {
+    map.get(key).and_then(|v| v.parse::<f64>().ok()).unwrap_or(default)
+}
+
+fn map_u64(map: &HashMap<String, String>, key: &str, default: u64) -> u64 {
+    map.get(key).and_then(|v| v.parse::<u64>().ok()).unwrap_or(default)
+}
+
+fn hot_settings_from_map(map: &HashMap<String, String>) -> (bool, HotSettings) {
+    let auto_buy = map_bool(map, "AUTO_BUY_NEW_TOKENS", AUTO_BUY_DEFAULT);
+
+    let settings = HotSettings {
+        trade_amount_sol: map_f64(map, "TRADE_AMOUNT_SOL", TRADE_AMOUNT_DEFAULT),
+        max_token_age_ms: map_u64(map, "MAX_TOKEN_AGE_MS", MAX_TOKEN_AGE_DEFAULT),
+        auto_sell_profit_pct: map_f64(map, "AUTO_SELL_PROFIT_PCT", AUTO_SELL_PROFIT_DEFAULT),
+        slippage_pct: map_f64(map, "SLIPPAGE_PCT", SLIPPAGE_DEFAULT),
+        priority_fee_sol: map_f64(map, "PRIORITY_FEE_SOL", PRIORITY_FEE_DEFAULT),
+        mev_protection: map_bool(map, "MEV_PROTECTION", MEV_PROTECTION_DEFAULT),
+        pump_tokens_only: map_bool(map, "PUMP_TOKENS_ONLY", PUMP_ONLY_DEFAULT),
+        min_sol_reserve: map_f64(map, "MIN_SOL_RESERVE", MIN_SOL_RESERVE_DEFAULT),
+    };
+
+    (auto_buy, settings)
+}
+
+/// Polls the .env file for changes. Only applies values that actually
+/// changed in the file itself, so a manual on/off via the stdin console
+/// isn't stomped on every poll tick — only when you edit and save .env.
+async fn settings_watcher(app: App) {
+    let path = app.env_path.clone();
+
+    if !path.exists() {
+        log_line(
+            &app,
+            &format!(
+                "[SETTINGS] no .env file found at {} — live reload disabled, restart to apply changes",
+                path.display()
+            ),
+        )
+        .await;
         return;
     }
 
-    print_migration_card(&token);
-    println!("{}{}⏳ LIVE MODE: buying token with real mainnet funds...{}", BOLD, YELLOW, RESET);
-    println!("{}{}⚡ LIVE BUY → real trade for {}{:.1} SOL{}...{}", BOLD, YELLOW, GREEN, TRADE_AMOUNT_SOL, YELLOW, RESET);
-    println!("{}{}✓ BUY ATTEMPT STARTED{}", BOLD, GREEN, RESET);
-    println!("  {}↳{} {}{}{}", WHITE, RESET, BLUE, token.solscan_url, RESET);
-    println!();
-    println!("{}{}💎 MONITORING{}", BOLD, CYAN, RESET);
-    println!("{}{}{}", WHITE, MONITOR_LINE, RESET);
-    println!(
-        "[{}] {}{}{} | SOL {}+0.0000{} | MCap {}{}{} | {}+0.00%{}",
-        timestamp(), WHITE, clean_terminal_text(&token.name), RESET,
-        GREEN, RESET,
-        WHITE, token.market_cap, RESET,
-        GREEN, RESET,
-    );
+    let mut last_mtime = std::fs::metadata(path.as_path()).and_then(|m| m.modified()).ok();
+    let mut last_seen = hot_settings_from_map(&read_env_file(path.as_path()));
 
-    run_real_trade_cycle(&token).await;
+    loop {
+        sleep(Duration::from_millis(750)).await;
+
+        if app.config.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let Ok(mtime) = std::fs::metadata(path.as_path()).and_then(|m| m.modified()) else {
+            continue;
+        };
+
+        if Some(mtime) == last_mtime {
+            continue;
+        }
+        last_mtime = Some(mtime);
+
+        // Small grace period in case the editor is still mid-write.
+        sleep(Duration::from_millis(50)).await;
+
+        let map = read_env_file(path.as_path());
+        let (file_auto_buy, file_settings) = hot_settings_from_map(&map);
+
+        if (file_auto_buy, file_settings) == last_seen {
+            continue;
+        }
+        last_seen = (file_auto_buy, file_settings);
+
+        let current_auto_buy = app.config.auto_buy.load(Ordering::Relaxed);
+        if file_auto_buy != current_auto_buy {
+            app.config.auto_buy.store(file_auto_buy, Ordering::Relaxed);
+            log_line(
+                &app,
+                &format!(
+                    "[SETTINGS] auto_buy: {} -> {} (.env changed)",
+                    on_off(current_auto_buy),
+                    on_off(file_auto_buy)
+                ),
+            )
+            .await;
+        }
+
+        let current_settings = *app.hot.read().await;
+        if file_settings != current_settings {
+            *app.hot.write().await = file_settings;
+            log_line(&app, "[SETTINGS] trade parameters reloaded from .env").await;
+        }
+    }
 }
 
-// ----------------------------
-// TOKEN BOX LAYOUT
-// ----------------------------
-// Edit these lines to change the green box shown for every detected migration.
-fn print_migration_card(token: &Token) {
-    let title = format!("{}{}{}{}  {}·{}  {}{}{}{}", BOLD, BLUE, MIGRATION_TITLE, RESET, WHITE, RESET, BOLD, GREEN, PLATFORM_TITLE, RESET);
-    let name = format!("{}{}Name{}   {}{} ({})", BOLD, GRAY, RESET, BOLD, clean_terminal_text(&token.name), clean_terminal_text(&token.symbol));
-    let mint = format!("{}{}Mint{}   {}{}{}{}", BOLD, GRAY, RESET, BOLD, CYAN, clean_terminal_text(&token.mint), RESET);
-    let chart = format!("{}{}Chart{}  {}{}{}{}", BOLD, GRAY, RESET, BOLD, BLUE, token.chart_url, RESET);
-    let width = [title.as_str(), name.as_str(), mint.as_str(), chart.as_str()]
-        .iter()
-        .map(|line| terminal_visible_len(line))
-        .max()
-        .unwrap_or(TOKEN_BOX_WIDTH)
-        .max(TOKEN_BOX_WIDTH)
-        .saturating_sub(1);
+// ---- wallet balance polling ----
 
-    println!();
-    println!("{}{}┏{}┓{}", BOLD, GREEN, "━".repeat(width), RESET);
-    print_box_line(&title, width);
-    print_box_line(&name, width);
-    print_box_line(&mint, width);
-    print_box_line(&chart, width);
-    println!("{}{}┗{}┛{}", BOLD, GREEN, "━".repeat(width), RESET);
-}
+async fn balance_watcher(app: App) {
+    loop {
+        if app.config.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
 
-fn print_box_line(content: &str, width: usize) {
-    // `width` is the number of columns between the two corners. We reserve one
-    // column for the left gutter and trim the computed padding by one so the
-    // right border sits flush with the top/bottom border.
-    let spaces = width
-        .saturating_sub(terminal_visible_len(content))
-        .saturating_sub(1);
-    println!("{}{}┃{} {}{}{}{}{}{}┃{}", BOLD, GREEN, RESET, BOLD, content, RESET, " ".repeat(spaces), BOLD, GREEN, RESET);
-}
-
-fn clean_terminal_text(value: &str) -> String {
-    value.replace(['\n', '\r', '\x1b'], " ")
-}
-
-fn terminal_visible_len(value: &str) -> usize {
-    let mut len = 0;
-    let mut chars = value.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            for end in chars.by_ref() {
-                if end.is_ascii_alphabetic() { break; }
+        match fetch_sol_balance(&app).await {
+            Ok(balance) => {
+                *app.sol_balance.write().await = Some(balance);
+                refresh_status(&app).await;
             }
-        } else {
-            // Emoji and East Asian-wide characters take two terminal columns.
-            len += if ch as u32 > 0xFF { 2 } else { 1 };
+            Err(err) => {
+                eprintln!("[BALANCE] {err}");
+            }
         }
+
+        sleep(Duration::from_secs(15)).await;
     }
-    len
 }
 
-fn record_trade_entry_if_needed(token: &Token) -> bool {
-    let mut positions = ACTIVE_POSITIONS.lock().unwrap();
-    for pos in positions.iter() {
-        if pos.mint == token.mint {
-            return true;
-        }
-    }
+async fn fetch_sol_balance(app: &App) -> Result<f64, Box<dyn Error + Send + Sync>> {
+    let payload: Value = app
+        .http
+        .post(&app.config.rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [app.keypair.pubkey().to_string()]
+        }))
+        .send()
+        .await?
+        .json()
+        .await?;
 
-    if !AUTO_BUY_NEW_TOKENS {
-        return false;
-    }
+    let lamports = payload
+        .get("result")
+        .and_then(|r| r.get("value"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("getBalance returned no value: {payload}"))?;
 
-    if token.name.is_empty() || token.mint.is_empty() || token.chart_url.is_empty() {
-        return false;
-    }
-
-    positions.push(Position {
-        mint: token.mint.clone(),
-        name: token.name.clone(),
-        symbol: token.symbol.clone(),
-        chart_url: token.chart_url.clone(),
-        snip_url: token.solscan_url.clone(),
-        entry_sol: TRADE_AMOUNT_SOL,
-        last_pct: 0.0,
-        last_sol: 0.0,
-    });
-
-    true
+    Ok(lamports as f64 / 1_000_000_000.0)
 }
 
-#[allow(dead_code)]
-fn print_trade_monitor(token: &Token, change_pct: f64, change_sol: f64) {
-    let color = if change_pct >= 0.0 { GREEN } else { RED };
-    let sign = if change_pct >= 0.0 { "+" } else { "-" };
+// ---- display helpers ----
 
-    println!("{}MONITORING{} {}", CYAN, RESET, token.name);
-    println!(
-        "[{}] {} | ${:.8} | ${:.1}K | EST {}{:.2}% | REAL {}{:.2}% | {}{} {:.4} SOL",
-        timestamp(),
-        token.name,
-        0.00000139,
-        1.4,
-        sign,
-        change_pct.abs(),
-        sign,
-        change_pct.abs(),
-        color,
-        sign,
-        change_sol.abs(),
-    );
-    println!("{}P/L:{} {}{}{:.2}%{} | {}{}{:.4} SOL{}", CYAN, RESET, color, sign, change_pct.abs(), RESET, color, sign, change_sol.abs(), RESET);
-}
-
-#[allow(dead_code)]
-fn print_sell_summary(change_sol: f64) {
-    let sell_ready = should_sell_position(change_sol.abs() + 0.1, 0.1, 50.0);
-    let color = if change_sol >= 0.0 { GREEN } else { RED };
-    let sign = if change_sol >= 0.0 { "+" } else { "-" };
-
-    if change_sol >= 0.0 {
-        println!("{}SELL RESULT:{} {}PROFIT {}{:.4} SOL{} | SELL READY: {}{}", GREEN, RESET, color, sign, change_sol, RESET, if sell_ready { "YES" } else { "NO" }, RESET);
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "ON"
     } else {
-        println!("{}SELL RESULT:{} {}LOSS {}{:.4} SOL{} | SELL READY: {}{}", RED, RESET, color, sign, change_sol.abs(), RESET, if sell_ready { "YES" } else { "NO" }, RESET);
+        "OFF"
     }
 }
 
-#[allow(dead_code)]
-fn estimate_trade_delta(token: &Token) -> (f64, f64) {
-    let market_cap = parse_market_cap_value(&token.market_cap);
-    let raw_delta = ((market_cap - 30.0) / 30.0) * 100.0;
-    let delta_sol = (raw_delta / 100.0) * 0.1;
-    (raw_delta, delta_sol)
+/// OSC 8 terminal hyperlink escape sequence. Supported by most modern
+/// terminals (GNOME Terminal, Konsole, kitty, Alacritty, iTerm2, Windows
+/// Terminal). In terminals without support, the label text still shows
+/// and can be copied/opened manually.
+fn hyperlink(url: &str, label: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\")
 }
 
-#[allow(dead_code)]
-fn parse_market_cap_value(raw: &str) -> f64 {
-    let cleaned = raw.trim().replace(" SOL", "").replace(",", "");
-    cleaned.parse::<f64>().unwrap_or(30.0)
+fn token_card(label: &str, color: &str, name: &str, symbol: &str, mint: &str) -> String {
+    let url = format!("https://pump.fun/coin/{mint}");
+    let link = hyperlink(&url, &url);
+    let top = "─".repeat(44);
+    let bottom = "─".repeat(46);
+
+    [
+        format!("{color}┌{top}{RESET}"),
+        format!("{color}│{RESET} {BOLD}{label}{RESET} {DIM}· pump.fun{RESET}"),
+        format!("{color}│{RESET}"),
+        format!("{color}│{RESET}  Name   {BOLD}{name}{RESET} {DIM}({symbol}){RESET}"),
+        format!("{color}│{RESET}  Mint   {DIM}{mint}{RESET}"),
+        format!("{color}│{RESET}  Link   {CYAN}{UNDERLINE}{link}{RESET}"),
+        format!("{color}└{bottom}{RESET}"),
+    ]
+    .join("\n")
 }
 
-fn should_trade_pump_token(token: &Token) -> bool {
-    if token.mint.is_empty() {
-        return false;
-    }
+async fn print_status_line_locked(app: &App) {
+    let auto_buy = app.config.auto_buy.load(Ordering::Relaxed);
+    let bought = app.bought_count.load(Ordering::Relaxed);
+    let migrations = app.migration_count.load(Ordering::Relaxed);
+    let balance = *app.sol_balance.read().await;
 
-    token.mint.ends_with("pump") || token.pump_url.contains("pump.fun")
+    let balance_str = match balance {
+        Some(b) => format!("{b:.4} SOL"),
+        None => "…".to_string(),
+    };
+
+    let auto_buy_str = if auto_buy {
+        format!("{GREEN}{BOLD}AUTO-BUY ON{RESET}")
+    } else {
+        format!("{RED}{BOLD}AUTO-BUY OFF{RESET}")
+    };
+
+    print!(
+        "\r\x1b[2K{DIM}Wallet{RESET} {balance_str}  │  {auto_buy_str}  │  {DIM}Migrations{RESET} {migrations}  {DIM}Bought{RESET} {bought}  │  {GREEN}●{RESET} LIVE"
+    );
+
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
-#[allow(dead_code)]
-fn should_sell_position(current_value_sol: f64, entry_sol: f64, profit_pct: f64) -> bool {
-    let profit = ((current_value_sol - entry_sol) / entry_sol.max(0.000001)) * 100.0;
-    profit >= profit_pct
+/// Prints a log line above the persistent status line, then redraws the
+/// status line underneath it. All stdout writes go through the print_lock
+/// so concurrent tasks (buy/sell handlers, settings watcher, balance
+/// watcher) don't interleave mid-line.
+async fn log_line(app: &App, text: &str) {
+    let _guard = app.print_lock.lock().await;
+    print!("\r\x1b[2K");
+    println!("{text}");
+    print_status_line_locked(app).await;
 }
 
-fn timestamp() -> String {
-    chrono::Local::now().format("%H:%M:%S").to_string()
+/// Redraws just the status line in place (no new log entry).
+async fn refresh_status(app: &App) {
+    let _guard = app.print_lock.lock().await;
+    print_status_line_locked(app).await;
 }
 
-fn format_market_cap(value: f64) -> String {
-    format!("{:.2} SOL", value)
-}
+async fn print_startup(
+    app: &App,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let pubkey = app.keypair.pubkey();
+    let hot = *app.hot.read().await;
 
-fn format_initial_buy(value: f64) -> String {
-    if value.abs() < 1e-9 {
-        return "0 tokens".to_string();
-    }
-    format!("{:.0} tokens", value)
-}
+    println!();
+    println!("========== PUMP.FUN SNIPER ==========");
+    println!("Wallet: {}", pubkey);
+    println!("Auto buy: {}", on_off(app.config.auto_buy.load(Ordering::Relaxed)));
+    println!("Trade: {:.4} SOL", hot.trade_amount_sol);
+    println!("Max token age: {} ms", hot.max_token_age_ms);
+    println!("Auto sell: +{:.0}%", hot.auto_sell_profit_pct);
+    println!("Slippage: {:.1}%", hot.slippage_pct);
+    println!("Priority fee: {:.9} SOL", hot.priority_fee_sol);
+    println!("MEV protection: {}", hot.mev_protection);
+    println!("Pump.fun only: {}", hot.pump_tokens_only);
+    println!("Minimum reserve: {:.4} SOL", hot.min_sol_reserve);
+    println!("Live .env reload: watching {}", app.env_path.display());
+    println!("=====================================");
+    println!();
 
-fn get_string(value: &Value, keys: &[&str]) -> Option<String> {
-    for key in keys {
-        if let Some(v) = value.get(*key) {
-            if let Some(s) = v.as_str() {
-                return Some(s.to_string());
-            }
-            if let Some(n) = v.as_f64() {
-                return Some(n.to_string());
-            }
-            if let Some(n) = v.as_i64() {
-                return Some(n.to_string());
-            }
-            if let Some(n) = v.as_u64() {
-                return Some(n.to_string());
-            }
-        }
-    }
-    None
-}
+    refresh_status(app).await;
 
-fn get_f64(value: &Value, keys: &[&str]) -> Option<f64> {
-    for key in keys {
-        if let Some(v) = value.get(*key) {
-            if let Some(n) = v.as_f64() {
-                return Some(n);
-            }
-            if let Some(n) = v.as_i64() {
-                return Some(n as f64);
-            }
-            if let Some(n) = v.as_u64() {
-                return Some(n as f64);
-            }
-        }
-    }
-    None
+    Ok(())
 }

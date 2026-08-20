@@ -49,15 +49,45 @@ const MEV_PROTECTION_DEFAULT: bool = false;
 const PUMP_ONLY_DEFAULT: bool = true;
 const MIN_SOL_RESERVE_DEFAULT: f64 = 0.01;
 
-// ---- terminal styling (no extra crates needed) ----
+// ----------------------------
+// TERMINAL STYLING
+// ----------------------------
+
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const UNDERLINE: &str = "\x1b[4m";
+
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
+
+// ----------------------------
+// TOKEN LAYOUT SETTINGS
+// ----------------------------
+
+// Main width of token cards.
+// Long links automatically expand the box.
+const TOKEN_BOX_WIDTH: usize = 93;
+
+const MIGRATION_TITLE: &str = "🎯 MIGRATION";
+const PLATFORM_TITLE: &str = "🟢 PUMP.FUN";
+
+const MONITOR_LINE: &str =
+    "─────────────────────────────────────────────────────────────────────────────────────────────────────";
+
+// ----------------------------
+// STARTUP ASCII
+// ----------------------------
+
+const PUMP_ASCII: &str = r#" ______   __  __   ___ __ __   ______
+/_____ /\ /_/\/_/\ /__//_//_/\ /_____ /\
+\:::_ \ \\:\ \:\ \\::\| \| \ \\:::_ \ \
+ \:(_) \ \\:\ \:\ \\:.      \ \\:(_) \ \
+  \: ___\/ \:\ \:\ \\:.\-/\  \ \\: ___\/
+   \ \ \    \:\_\:\ \ . \  \ \\ \ \
+    \_\/     \_____\/ \__\/ \__\/ \_\/"#;
 
 /// Settings that stay fixed for the life of the process.
 #[derive(Clone)]
@@ -1087,28 +1117,75 @@ fn hyperlink(url: &str, label: &str) -> String {
     format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\")
 }
 
-fn token_card(label: &str, color: &str, name: &str, symbol: &str, mint: &str) -> String {
+fn token_card(
+    label: &str,
+    color: &str,
+    name: &str,
+    symbol: &str,
+    mint: &str,
+) -> String {
     let url = format!("https://pump.fun/coin/{mint}");
     let link = hyperlink(&url, &url);
-    let top = "─".repeat(44);
-    let bottom = "─".repeat(46);
+
+    let title = if label.eq_ignore_ascii_case("MIGRATION") {
+        MIGRATION_TITLE
+    } else {
+        PLATFORM_TITLE
+    };
+
+    let name_text = format!("Name   {} ({})", name, symbol);
+    let mint_text = format!("Mint   {}", mint);
+    let link_text = format!("Link   {}", url);
+
+    let content_width = TOKEN_BOX_WIDTH
+        .max(name_text.chars().count())
+        .max(mint_text.chars().count())
+        .max(link_text.chars().count());
+
+    let horizontal = "─".repeat(content_width + 2);
+
+    let pad = |length: usize| -> String {
+        " ".repeat(content_width.saturating_sub(length))
+    };
 
     [
-        format!("{color}┌{top}{RESET}"),
-        format!("{color}│{RESET} {BOLD}{label}{RESET} {DIM}· pump.fun{RESET}"),
-        format!("{color}│{RESET}"),
-        format!("{color}│{RESET}  Name   {BOLD}{name}{RESET} {DIM}({symbol}){RESET}"),
-        format!("{color}│{RESET}  Mint   {DIM}{mint}{RESET}"),
-        format!("{color}│{RESET}  Link   {CYAN}{UNDERLINE}{link}{RESET}"),
-        format!("{color}└{bottom}{RESET}"),
+        format!("{color}┌{horizontal}┐{RESET}"),
+
+        format!(
+            "{color}│{RESET} {BOLD}{title}{RESET} {DIM}· {label}{RESET}{} {color}│{RESET}",
+            pad(title.chars().count() + 3 + label.chars().count() + 1)
+        ),
+
+        format!(
+            "{color}│{RESET}{} {color}│{RESET}",
+            " ".repeat(content_width + 1)
+        ),
+
+        format!(
+            "{color}│{RESET}  Name   {BOLD}{name}{RESET} {DIM}({symbol}){RESET}{} {color}│{RESET}",
+            pad(name_text.chars().count())
+        ),
+
+        format!(
+            "{color}│{RESET}  Mint   {DIM}{mint}{RESET}{} {color}│{RESET}",
+            pad(mint_text.chars().count())
+        ),
+
+        format!(
+            "{color}│{RESET}  Link   {CYAN}{UNDERLINE}{link}{RESET}{} {color}│{RESET}",
+            pad(link_text.chars().count())
+        ),
+
+        format!("{color}└{horizontal}┘{RESET}"),
     ]
     .join("\n")
 }
 
+
 async fn print_status_line_locked(app: &App) {
     let auto_buy = app.config.auto_buy.load(Ordering::Relaxed);
     let bought = app.bought_count.load(Ordering::Relaxed);
-    let migrations = app.migration_count.load(Ordering::Relaxed);
+    let migrations = app.migration_count.load(Ordering::Relaxed); 
     let balance = *app.sol_balance.read().await;
 
     let balance_str = match balance {
@@ -1153,9 +1230,15 @@ async fn print_startup(
     let hot = *app.hot.read().await;
 
     println!();
-    println!("========== PUMP.FUN SNIPER ==========");
+    println!("{CYAN}{PUMP_ASCII}{RESET}");
+    println!();
+
+    println!("{GREEN}{BOLD}========== PUMP.FUN SNIPER =========={RESET}");
     println!("Wallet: {}", pubkey);
-    println!("Auto buy: {}", on_off(app.config.auto_buy.load(Ordering::Relaxed)));
+    println!(
+        "Auto buy: {}",
+        on_off(app.config.auto_buy.load(Ordering::Relaxed))
+    );
     println!("Trade: {:.4} SOL", hot.trade_amount_sol);
     println!("Max token age: {} ms", hot.max_token_age_ms);
     println!("Auto sell: +{:.0}%", hot.auto_sell_profit_pct);
@@ -1166,6 +1249,11 @@ async fn print_startup(
     println!("Minimum reserve: {:.4} SOL", hot.min_sol_reserve);
     println!("Live .env reload: watching {}", app.env_path.display());
     println!("=====================================");
+
+    println!();
+    println!("{DIM}{MONITOR_LINE}{RESET}");
+    println!("{GREEN}{BOLD}LIVE TOKEN MONITOR{RESET}");
+    println!("{DIM}{MONITOR_LINE}{RESET}");
     println!();
 
     refresh_status(app).await;

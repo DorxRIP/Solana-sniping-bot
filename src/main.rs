@@ -81,13 +81,15 @@ const MONITOR_LINE: &str =
 // STARTUP ASCII
 // ----------------------------
 
-const PUMP_ASCII: &str = r#" ______   __  __   ___ __ __   ______
-/_____ /\ /_/\/_/\ /__//_//_/\ /_____ /\
-\:::_ \ \\:\ \:\ \\::\| \| \ \\:::_ \ \
- \:(_) \ \\:\ \:\ \\:.      \ \\:(_) \ \
-  \: ___\/ \:\ \:\ \\:.\-/\  \ \\: ___\/
-   \ \ \    \:\_\:\ \ . \  \ \\ \ \
-    \_\/     \_____\/ \__\/ \__\/ \_\/"#;
+const PUMP_ASCII: &str = r#" 
+ ______   __  __   ___ __ __   ______    
+/_____/\ /_/\/_/\ /__//_//_/\ /_____/\   
+\:::_ \ \\:\ \:\ \\::\| \| \ \\:::_ \ \  
+ \:(_) \ \\:\ \:\ \\:.      \ \\:(_) \ \ 
+  \: ___\/ \:\ \:\ \\:.\-/\  \ \\: ___\/ 
+   \ \ \    \:\_\:\ \\. \  \  \ \\ \ \   
+    \_\/     \_____\/ \__\/ \__\/ \_\/   
+                                          "#;
 
 /// Settings that stay fixed for the life of the process.
 #[derive(Clone)]
@@ -1185,7 +1187,7 @@ fn token_card(
 async fn print_status_line_locked(app: &App) {
     let auto_buy = app.config.auto_buy.load(Ordering::Relaxed);
     let bought = app.bought_count.load(Ordering::Relaxed);
-    let migrations = app.migration_count.load(Ordering::Relaxed); 
+    let migrations = app.migration_count.load(Ordering::Relaxed);
     let balance = *app.sol_balance.read().await;
 
     let balance_str = match balance {
